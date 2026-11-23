@@ -1,0 +1,17 @@
+node_modules
+dist
+dev-dist
+.env
+.env.*
+!.env.example
+.data
+test-results
+playwright-report
+coverage
+*.tsbuildinfo
+.vercel
+dist-server
+
+# Generated evidence (screenshots from the test runs, sample wallpaper renders).
+# Regenerate with `npm run test:e2e` and `npx tsx scripts/render-samples.ts`.
+docs/evidence/
