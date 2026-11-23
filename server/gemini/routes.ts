@@ -133,6 +133,18 @@ export function createAiRouter(deps: AiDeps): Router {
     const signal = AbortSignal.any([abortOnDisconnect(res), timeLimit.signal]);
     const sse = openSse<PlanStreamEvent>(res, { keepAliveMs: deps.tuning.keepAliveMs });
     const call: CallContext = { ...callContext(deps, gemini, signal), deadlineMs: timeLimit.deadlineMs };
+    const startedAt = Date.now();
+    // The HTTP status is 200 as soon as the event stream opens, so a failure DURING planning arrives as
+    // an `error` event. This line states what the caller really got, so the logs never say "200 OK" alone.
+    const outcome = (fields: Record<string, unknown>) =>
+      deps.recorder.result({
+        route: '/api/plan',
+        transport: 'sse',
+        httpStatus: 200,
+        totalMs: Date.now() - startedAt,
+        modelsTried: [...new Set(call.runs.map((r) => r.model))],
+        ...fields,
+      });
     try {
       const model = await models.resolve();
       models.warmFallbacks();
@@ -150,8 +162,17 @@ export function createAiRouter(deps: AiDeps): Router {
       });
       sse.send({ event: 'status', data: { phase: 'done', message: 'Your plan is ready.' } });
       sse.send({ event: 'result', data: result });
+      outcome({ outcome: 'ok', model: result.runs.at(-1)?.model ?? model, repaired: result.repaired });
     } catch (err) {
       const e = toAppError(err, signal);
+      const upstream = (e.details ?? []).map((d) => /Gemini status (\d{3})/.exec(d)?.[1]).find(Boolean);
+      outcome({
+        outcome: e.code === 'CANCELLED' ? 'cancelled' : 'error',
+        code: e.code,
+        errorStatus: e.status,
+        retryable: e.retryable,
+        ...(upstream ? { upstreamStatus: Number(upstream) } : {}),
+      });
       // If the client cancelled there is nobody left to tell.
       if (e.code !== 'CANCELLED') sse.send({ event: 'error', data: e.toJSON() });
     } finally {

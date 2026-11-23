@@ -242,7 +242,9 @@ export default function PlanningPage() {
               <p className="mt-1 text-sm text-muted">{error.message}</p>
               {error.details && error.details.length > 0 && (
                 <details className="mt-3 text-xs text-muted">
-                  <summary className="cursor-pointer">What failed the checks</summary>
+                  <summary className="cursor-pointer">
+                    {error.code === 'PLAN_INVALID' ? 'What failed the checks' : 'Technical details'}
+                  </summary>
                   <ul className="mt-2 list-disc space-y-1 pl-4">
                     {error.details.slice(0, 8).map((d) => (
                       <li key={d}>{d}</li>
@@ -287,7 +289,10 @@ function errorTitle(e: ApiError): string {
     case 'INVALID_INPUT':
       return 'Something in your answers needs a fix';
     default:
-      return 'Planning failed';
+      // Google answered with an error status (its reason is in the technical details).
+      return e.details?.some((d) => /^Gemini status \d{3}/.test(d))
+        ? 'Gemini rejected the request'
+        : 'Planning failed';
   }
 }
 

@@ -22,6 +22,14 @@ export interface RunRecorder {
    * Google's error text). Never contains prompts or user text; secrets are redacted.
    */
   diag(event: Record<string, unknown>): void;
+  /**
+   * One `ai_error` line per FAILED Gemini request: model, stage, attempt, Google's HTTP status, status name,
+   * message, reason, field violations and quota details, and our own error code. Search the logs for
+   * "ai_error". Redacted; never contains prompts, user text or credentials.
+   */
+  error(event: Record<string, unknown>): void;
+  /** One `api_result` line per AI request: what the caller finally got (outcome, code, status). */
+  result(event: Record<string, unknown>): void;
 }
 
 export interface RunRecorderOptions {
@@ -39,6 +47,12 @@ export function createRunRecorder(opts: RunRecorderOptions): RunRecorder {
   return {
     diag(event) {
       log(redactSecrets(JSON.stringify({ type: 'ai_diag', ...event }), opts.secrets));
+    },
+    error(event) {
+      log(redactSecrets(JSON.stringify({ type: 'ai_error', ...event }), opts.secrets));
+    },
+    result(event) {
+      log(redactSecrets(JSON.stringify({ type: 'api_result', ...event }), opts.secrets));
     },
     record(meta) {
       log(JSON.stringify({ type: 'ai_run', ...meta }));

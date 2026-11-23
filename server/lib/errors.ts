@@ -83,7 +83,12 @@ export class AppError extends Error {
 
   /** The exact JSON shape the client receives (shared/api.ts → ApiError). */
   toJSON(): ApiError {
-    const out: ApiError = { code: this.code, message: this.message, retryable: this.retryable };
+    const out: ApiError = {
+      code: this.code,
+      message: this.message,
+      retryable: this.retryable,
+      status: this.status,
+    };
     if (this.details) out.details = this.details;
     return out;
   }
@@ -178,15 +183,19 @@ export function toAppError(err: unknown, signal?: AbortSignal): AppError {
         "Gemini rejected LOCKSTEP's plan format (HTTP 400: the response schema is too complex for this model). This is a problem on our side, not in your answers. Your saved plan still works.",
         {
           retryable: false,
+          // 502: the upstream service rejected OUR request; not the user's input.
+          status: 502,
           details: [...why(), 'Cause: response schema rejected by Gemini (not a temporary error).'],
         },
       );
     }
     if (status === 400) {
+      // Google rejected the request the SERVER built (502: an upstream rejection, not the user's input).
+      // Google's own reason is in the details; the server log has the full "ai_error" line.
       return new AppError(
         'INTERNAL',
-        "Gemini couldn't process this request. If you attached a file, try a different one.",
-        { retryable: false, details: why() },
+        "Gemini rejected this request (HTTP 400), so no plan was made. Your saved plan still works. Google's reason is in the technical details; if you attached a file, try without it.",
+        { retryable: false, status: 502, details: why() },
       );
     }
     return new AppError('INTERNAL', undefined, { details: why() });

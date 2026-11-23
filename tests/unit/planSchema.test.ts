@@ -204,9 +204,11 @@ describe('a schema rejection (HTTP 400 "too many states") is reported accurately
     expect(isTemporaryUnavailable(err)).toBe(false);
     expect(isThinkingRejection(err)).toBe(false);
   });
-  it('other 400s keep their old message; 429 quota is still temporary', () => {
+  it('other 400s: an accurate message and status 502; 429 quota is still temporary', () => {
     const other = toAppError(googleError(400, 'Request contains an invalid argument.'));
-    expect(other.message).toMatch(/couldn't process this request/);
+    expect(other.message).toMatch(/^Gemini rejected this request \(HTTP 400\), so no plan was made/);
+    expect(other.status).toBe(502); // an upstream rejection of the server's request, not the user's input
+    expect(other.toJSON()).toMatchObject({ code: 'INTERNAL', status: 502 });
     const quota = toAppError(
       googleError(
         429,

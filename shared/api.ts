@@ -43,6 +43,11 @@ export interface ApiError {
   retryable: boolean;
   /** Optional technical details safe to show (e.g. validation errors). */
   details?: string[];
+  /**
+   * The HTTP status this error stands for. A JSON error is also SENT with it; an error inside the
+   * /api/plan event stream arrives in a 200 response (the stream was already open), so read it here.
+   */
+  status?: number;
 }
 
 // ───────────── GET /api/health ─────────────

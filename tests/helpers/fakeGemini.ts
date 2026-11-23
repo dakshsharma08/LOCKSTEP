@@ -29,7 +29,7 @@ export interface FakeRequest {
 
 export interface FakeReply {
   /** Reply with Google's JSON error shape instead of an answer. */
-  error?: { status: number; message: string; code?: string };
+  error?: { status: number; message: string; code?: string; details?: unknown[] };
   /** Never answer at all (a black-holed connection). */
   neverRespond?: boolean;
   /** Wait this long before sending the HTTP headers. */
@@ -199,6 +199,7 @@ export async function startFakeGemini(
             code: reply.error.status,
             message: reply.error.message,
             status: reply.error.code ?? 'INVALID_ARGUMENT',
+            ...(reply.error.details ? { details: reply.error.details } : {}),
           },
         }),
       );

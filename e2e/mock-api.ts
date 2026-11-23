@@ -25,6 +25,8 @@ process.env.GEMINI_MODEL_FALLBACKS = 'gemini-e2e-fallback';
  * then go silent; the app must abandon it, send `reset`, and get the plan from gemini-e2e-fallback.
  */
 const STALL_MARKER = 'e2e-stall';
+/** Scenario marker: Google rejects the plan request with HTTP 400 (to test the error card). */
+const REJECT_MARKER = 'e2e-reject';
 
 /** /v1beta/models, /v1beta/models/<model>:generateContent, /v1beta/models/<model>:streamGenerateContent */
 const ROUTE = /^\/(v1[a-z0-9]*)\/models(?:\/([^/:]+):(generateContent|streamGenerateContent))?$/;
@@ -167,6 +169,26 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
 
   const body = (raw ? JSON.parse(raw) : {}) as Body & { tools?: unknown };
   if (method === 'streamGenerateContent') {
+    if (raw.includes(REJECT_MARKER)) {
+      res.writeHead(400, { 'content-type': 'application/json' }).end(
+        JSON.stringify({
+          error: {
+            code: 400,
+            status: 'INVALID_ARGUMENT',
+            message: "Invalid value at 'generation_config.response_mime_type'.",
+            details: [
+              {
+                '@type': 'type.googleapis.com/google.rpc.BadRequest',
+                fieldViolations: [
+                  { field: 'generation_config.response_mime_type', description: 'Invalid value.' },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+      return;
+    }
     const plan = fixturePlan(body);
     if (!raw.includes(STALL_MARKER)) return streamText(req, res, JSON.stringify(plan));
     if (model === 'gemini-e2e-fallback') {

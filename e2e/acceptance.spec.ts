@@ -299,3 +299,29 @@ test('a model that stalls mid-plan: its preview is cleared on reset, and the nex
   await expect(page.getByText(/Map the exam domains/).first()).toBeVisible();
   await expect(page.getByText(/STALE/)).toHaveCount(0);
 });
+
+test('Gemini rejects the request (HTTP 400): the error card says so and shows Google’s reason', async ({
+  page,
+}) => {
+  await page.goto('/new');
+  await page.getByRole('button', { name: 'Try a sample goal' }).click();
+  // The marker makes the fake Google answer HTTP 400 (e2e/mock-api.ts).
+  await page
+    .getByRole('textbox', { name: 'Your goal' })
+    .fill('Pass the AWS Cloud Practitioner exam (e2e-reject)');
+  for (let i = 0; i < 3; i++) await page.getByRole('button', { name: 'Continue' }).click();
+  await page.getByRole('button', { name: 'Plan with Gemini' }).click();
+
+  const card = page.getByRole('alert');
+  await expect(card.getByText('Gemini rejected the request')).toBeVisible({ timeout: 15_000 });
+  await expect(
+    card.getByText(/Gemini rejected this request \(HTTP 400\), so no plan was made/),
+  ).toBeVisible();
+  await card.locator('summary').getByText('Technical details', { exact: true }).click();
+  await expect(card.getByText('Gemini status 400')).toBeVisible();
+  await expect(
+    card.getByText("Google said: INVALID_ARGUMENT: Invalid value at 'generation_config.response_mime_type'."),
+  ).toBeVisible();
+  await expect(card.getByText('What failed the checks')).toHaveCount(0); // no checks ran
+  await expect(card.getByRole('button', { name: 'Build the plan myself' })).toBeVisible();
+});

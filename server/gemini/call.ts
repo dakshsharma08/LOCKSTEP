@@ -18,7 +18,7 @@ import { runMeta } from '../lib/aiRuns';
 import type { AiTuning } from '../lib/config';
 import { AppError, isRetryableUpstream, toAppError, upstreamStatus } from '../lib/errors';
 import { withRetry } from '../lib/retry';
-import { upstreamReason } from '../lib/redact';
+import { googleErrorInfo, upstreamReason } from '../lib/redact';
 import { raceAbort, withTimeout } from '../lib/timeout';
 import type { GeminiLike } from './client';
 
@@ -108,10 +108,12 @@ export async function callGemini(ctx: CallContext, args: CallArgs): Promise<Gene
   const t = ctx.tuning;
   const timeoutMs = args.timeoutMs ?? t.callTimeoutMs;
   let response: GenerateContentResponse;
+  let callAttempts = 0;
   try {
     response = await withRetry(
       async () => {
         const started = Date.now();
+        callAttempts++;
         try {
           const response = await withTimeout(
             (signal) =>
@@ -135,6 +137,21 @@ export async function callGemini(ctx: CallContext, args: CallArgs): Promise<Gene
             streaming: false,
             totalMs: Date.now() - started,
             ...failureInfo(err),
+          });
+          const mapped = toAppError(err, ctx.signal);
+          logFailure(ctx, {
+            kind: args.kind,
+            model: args.model,
+            stage:
+              googleStatus(err) !== undefined
+                ? 'http-error'
+                : mapped.code === 'TIMEOUT'
+                  ? 'waiting-for-answer'
+                  : 'network',
+            attempt: callAttempts,
+            startedMs: started,
+            err,
+            signal: ctx.signal,
           });
           throw err;
         }
@@ -169,6 +186,49 @@ function failureInfo(err: unknown): Record<string, unknown> {
     ...(status !== undefined ? { status, upstream: upstreamReason(err) } : {}),
     error: err instanceof AppError ? err.code : err instanceof Error ? err.name : 'unknown',
   };
+}
+
+/**
+ * One `ai_error` log line for ONE failed Gemini request (each HTTP attempt counts): where it failed
+ * (stage), Google's own answer (HTTP status, status name, message, reason, field violations, quota) and
+ * the error code the caller gets. Redacted by the recorder; never contains the prompt, user text or keys.
+ * A client that went away (CANCELLED) is not an error and is not logged here.
+ */
+function logFailure(
+  ctx: CallContext,
+  f: {
+    kind: AiKind;
+    model: string;
+    stage: string;
+    attempt: number;
+    startedMs: number;
+    err: unknown;
+    signal?: AbortSignal;
+    extra?: Record<string, unknown>;
+  },
+): void {
+  const mapped = toAppError(f.err, f.signal);
+  if (mapped.code === 'CANCELLED') return;
+  const google = googleErrorInfo(f.err);
+  ctx.recorder.error({
+    kind: f.kind,
+    model: f.model,
+    stage: f.stage,
+    attempt: f.attempt,
+    latencyMs: Date.now() - f.startedMs,
+    appCode: mapped.code,
+    appStatus: mapped.status,
+    ...(google ?? {}),
+    // Our own failures (timeouts, cut-off answers) have no Google body: say what happened instead.
+    ...(google ? {} : { cause: (mapped.details ?? [mapped.message]).join(' | ').slice(0, 300) }),
+    ...f.extra,
+  });
+}
+
+/** The stage named in one of our own TIMEOUT errors ("phase: streaming (…)" → "streaming"). */
+function phaseOf(err: AppError): string | null {
+  const d = (err.details ?? []).find((x) => x.startsWith('phase: '));
+  return d ? d.slice('phase: '.length).split(' (')[0]! : null;
 }
 
 /** Where the time went in one streaming attempt (milliseconds since the request was sent). */
@@ -387,6 +447,17 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
           return { stream: first.done ? null : stream, attemptCtrl };
         } catch (err) {
           record(ctx, runMeta(args.kind, args.model, started, false, null));
+          const mapped = toAppError(err, attemptSignal);
+          logFailure(ctx, {
+            kind: args.kind,
+            model: args.model,
+            stage: googleStatus(err) !== undefined ? 'http-error' : (phaseOf(mapped) ?? stallPhase(ph)),
+            attempt: attempts,
+            startedMs: started,
+            err,
+            signal: attemptSignal,
+            extra: { thinking: args.request.config?.thinkingConfig ?? null },
+          });
           throw err;
         } finally {
           clearTimeout(firstTimer);
@@ -425,6 +496,20 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
       }
     } catch (err) {
       record(ctx, runMeta(args.kind, args.model, started, false, tokensOf(lastUsage)));
+      logFailure(ctx, {
+        kind: args.kind,
+        model: args.model,
+        // An error EVENT inside the stream carries Google's status; otherwise it is our own stop.
+        stage:
+          googleStatus(err) !== undefined
+            ? 'error-event-in-stream'
+            : (phaseOf(toAppError(err, attemptSignal)) ?? 'streaming'),
+        attempt: attempts,
+        startedMs: started,
+        err,
+        signal: attemptSignal,
+        extra: { chunks: ph.chunks, thoughtChunks: ph.thoughtChunks, textChunks: ph.textChunks },
+      });
       // Let the SDK's generator finish cleaning up; its late rejection is expected.
       stream?.return(undefined).catch(() => {});
       throw err;
@@ -439,7 +524,17 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
     // answer on to validation or repair: report it, and let the caller try another model.
     if (ph.finishReason !== 'STOP') {
       record(ctx, runMeta(args.kind, args.model, started, false, tokensOf(lastUsage)));
-      throw incompleteAnswer(ph);
+      const cut = incompleteAnswer(ph);
+      logFailure(ctx, {
+        kind: args.kind,
+        model: args.model,
+        stage: 'incomplete-answer',
+        attempt: attempts,
+        startedMs: started,
+        err: cut,
+        extra: { finishReason: ph.finishReason ?? null, chunks: ph.chunks, ...usageBreakdown(lastUsage) },
+      });
+      throw cut;
     }
     record(ctx, runMeta(args.kind, args.model, started, true, tokensOf(lastUsage)));
     diag(true, { phase: 'done', tokens: tokensOf(lastUsage) });

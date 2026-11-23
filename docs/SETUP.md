@@ -96,6 +96,15 @@ gcloud run deploy lockstep --source . --region us-central1 --allow-unauthenticat
 
 (Cloud Run builds with Google's Node buildpack: `npm run build`, then `npm start`. `TRUST_PROXY=1` lets rate limiting see the real client IP behind Google's front end. Without it, all clients share one bucket, which is safe but strict.)
 
+### Troubleshooting a failed plan in production (Vercel logs)
+
+`/api/plan` answers as an event stream, so Vercel shows **200** even when planning failed: the error travels inside the stream. In the runtime logs, search for:
+
+- `api_result`: one line per plan request with the real outcome (`"outcome":"error"`, `code`, `errorStatus`, `upstreamStatus`, `modelsTried`).
+- `ai_error`: one line per failed Gemini request with `model`, `stage` (`http-error`, `waiting-for-first-chunk`, `streaming`, `incomplete-answer`…), `httpStatus`, `googleStatus`, `googleMessage`, `googleReason` (e.g. `API_KEY_INVALID`), `fieldViolations`, `quotaIds`, `retryDelay`, and the app's `appCode`/`appStatus`.
+
+These lines never contain the API key, the prompt or the user's goal. Typical readings: `googleReason: API_KEY_INVALID` → fix `GEMINI_API_KEY` in Vercel (no quotes, Production scope) and redeploy; `httpStatus: 404` → the model isn't available to this key (set `GEMINI_MODEL`); `httpStatus: 429` + `quotaIds` → free-tier quota; a 400 with `fieldViolations` → a request field this model/API version rejects (compare `GEMINI_API_VERSION` locally and on Vercel).
+
 ## 4. Durable rate limiting + Living Wallpaper storage (recommended for serverless)
 
 Serverless instances don't share memory, so in-memory rate limits and wallpaper links don't survive between requests. Create a free **Upstash Redis** database (https://console.upstash.com), copy the REST URL and token into `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN`, and redeploy. `GET /api/health` then reports `"rateLimit": "upstash"` and `"wallpaperStore": "upstash"`.
