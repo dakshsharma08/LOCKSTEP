@@ -18,6 +18,7 @@ import {
   type ListModelsParameters,
   type Model,
 } from '@google/genai';
+import { pickFallbacks } from './fallback';
 
 export interface GeminiLike {
   models: {
@@ -81,6 +82,10 @@ export interface ModelResolverOptions {
   /** How long to remember a FAILED lookup before trying models.list() again. */
   failCacheMs?: number;
   nowMs?: () => number;
+  /** Explicit alternatives (GEMINI_MODEL_FALLBACKS). null = pick automatically; [] = disabled. */
+  fallbacks?: string[] | null;
+  /** Most alternatives to return. */
+  maxFallbacks?: number;
 }
 
 export class ModelResolver {
@@ -97,6 +102,36 @@ export class ModelResolver {
 
   get heavy(): string | null {
     return this.opts.heavy;
+  }
+
+  /**
+   * Alternatives to try if `primary` is temporarily unavailable. Never throws.
+   * Explicit list (GEMINI_MODEL_FALLBACKS) wins; otherwise they are picked from the models THIS key can
+   * call, so a retired model can never end up in the chain. Looked up lazily (only after a failure).
+   */
+  async fallbacksFor(primary: string): Promise<string[]> {
+    const max = this.opts.maxFallbacks ?? 2;
+    const explicit = this.opts.fallbacks;
+    if (explicit) return explicit.filter((m) => m !== primary).slice(0, max);
+    if (explicit !== undefined && explicit !== null) return []; // an empty list = disabled
+    try {
+      return pickFallbacks(await this.listedNames(), primary, max);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Load the key's model list in the background, so alternatives are already known if an outage hits.
+   * Why: during heavy overload even models.list can return 503, which is the worst time to discover that
+   * we don't know any alternatives. No-op if the list is cached (it is, in auto mode) or if the alternatives
+   * are explicit / disabled. Costs at most one cached call per hour.
+   */
+  warmFallbacks(): void {
+    const explicit = this.opts.fallbacks;
+    if (explicit !== undefined && explicit !== null) return;
+    if (this.names && this.names.until > this.nowMs()) return;
+    void this.listedNames().catch(() => undefined);
   }
 
   /** The default model name. Never throws: falls back to the alias. */

@@ -21,8 +21,10 @@ const levelOf = (r: FakeRequest) =>
 async function diagnose(
   decide: (r: FakeRequest) => FakeReply | void,
   extra: Parameters<typeof runDiagnostics>[0] extends infer O ? Partial<O> : never = {},
+  /** Models the fake key can call (default: just gemini-3.8-flash). */
+  models?: string[],
 ) {
-  fake = await startFakeGemini(decide);
+  fake = await startFakeGemini(decide, models ? { models } : {});
   const lines: string[] = [];
   const report = await runDiagnostics({
     apiKey: KEY,
@@ -91,5 +93,66 @@ describe('diagnose: reaches the right conclusion', () => {
   it("flags a model that is not in the key's model list", async () => {
     const { report } = await diagnose(() => ({}), { model: 'gemini-9.9-flash', skipPlan: true });
     expect(report.verdict.join('\n')).toMatch(/MODEL NOT AVAILABLE/);
+  });
+});
+
+describe('diagnose: overloaded primary (HTTP 503) and the fallback chain', () => {
+  const overloaded = {
+    error: { status: 503, code: 'UNAVAILABLE', message: 'This model is currently experiencing high demand.' },
+  };
+  const MODELS = ['gemini-3.8-flash', 'gemini-3.6-flash'];
+
+  it('primary 503 + a working alternative: says so, and the full flow really falls back', async () => {
+    const { report, text } = await diagnose(
+      (r) => (r.model === 'gemini-3.8-flash' ? overloaded : {}),
+      {},
+      MODELS,
+    );
+
+    expect(report.modelsListed).toEqual(['gemini-3.6-flash', 'gemini-3.8-flash']);
+    expect(report.alternatives.map((a) => [a.model, a.timing.ok])).toEqual([['gemini-3.6-flash', true]]);
+    expect(report.minimal.every((m) => m.timing.status === 503)).toBe(true);
+    const v = report.verdict.join('\n');
+    expect(v).toMatch(/OVERLOADED: Google answered HTTP 503 for gemini-3\.8-flash/);
+    expect(v).toMatch(/FALLBACK READY: gemini-3\.6-flash answered/);
+    // The app's own /api/plan flow, end to end, used the alternative.
+    expect(report.flow).toMatchObject({ ok: true, fellBack: true, model: 'gemini-3.6-flash' });
+    expect(v).toMatch(/FULL FLOW OK.*written by gemini-3\.6-flash after falling back/);
+    expect(text).toMatch(/Fallback chain: gemini-3\.8-flash → gemini-3\.6-flash/);
+    expect(text).toMatch(/Trying gemini-3\.6-flash instead/);
+    expect(text).not.toContain(KEY);
+  });
+
+  it('generation 503 everywhere but the list works: NO WORKING ALTERNATIVE, and the flow fails honestly with AI_BUSY', async () => {
+    const { report, text } = await diagnose((r) => (r.model ? overloaded : {}), {}, MODELS);
+
+    const v = report.verdict.join('\n');
+    expect(v).toMatch(/OVERLOADED/);
+    expect(v).toMatch(/NO WORKING ALTERNATIVE right now: gemini-3\.6-flash \(HTTP 503\)/);
+    expect(report.flow?.ok).toBe(false);
+    expect(report.flow?.error?.code).toBe('AI_BUSY');
+    expect(v).toMatch(/FULL FLOW FAILED: AI_BUSY/);
+    expect(text).not.toContain(KEY);
+  });
+
+  it('even the model list returns 503: "Google unavailable", never "network problem"', async () => {
+    const { report, text } = await diagnose(() => overloaded, { skipPlan: true }, MODELS);
+
+    const v = report.verdict.join('\n');
+    expect(v).toMatch(/GOOGLE UNAVAILABLE: even listing models returned HTTP 503/);
+    expect(v).not.toMatch(/NETWORK PROBLEM/);
+    expect(v).toMatch(/NO ALTERNATIVE KNOWN: the model list itself is unavailable/);
+    expect(text).toMatch(/\[2\/6\] Minimal request/); // it kept diagnosing instead of stopping
+  });
+
+  it('primary 503 and the key lists no other stable Flash model: says so', async () => {
+    // The list works (only one model is on it); generation is what is overloaded.
+    const { report } = await diagnose((r) => (r.model ? overloaded : {}), { skipPlan: true }, [
+      'gemini-3.8-flash',
+    ]);
+    expect(report.alternatives).toHaveLength(0);
+    expect(report.verdict.join('\n')).toMatch(
+      /NO ALTERNATIVE MODEL: this key lists no other stable Flash model/,
+    );
   });
 });

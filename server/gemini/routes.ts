@@ -31,6 +31,7 @@ import { CoachRequestSchema, runCoach } from './coach';
 import { WeeklyInsightRequestSchema, generateWeeklyInsight } from './insight';
 import { MotivationRequestSchema, generateMotivation, type MotivationCache } from './motivation';
 import type { PlanThinking } from './thinking';
+import type { ModelPool } from './fallback';
 import { BackgroundRequestSchema, generateBackground, type ImageModelResolver } from './background';
 import { generatePlan, preparePlanJob } from './plan';
 
@@ -111,7 +112,14 @@ export function createAiRouter(deps: AiDeps): Router {
     const call = callContext(deps, gemini, signal);
     try {
       const model = await models.resolve();
-      const result = await generatePlan(call, job, model, (e) => sse.send(e), {
+      models.warmFallbacks();
+      // The primary stays gemini-3.8-flash (or GEMINI_MODEL). Alternatives are only looked up if it fails.
+      const pool: ModelPool = {
+        primary: model,
+        fallbacks: () => models.fallbacksFor(model),
+        limits: deps.tuning.modelFallback,
+      };
+      const result = await generatePlan(call, job, pool, (e) => sse.send(e), {
         thinking: deps.planThinking,
       });
       sse.send({ event: 'status', data: { phase: 'done', message: 'Your plan is ready.' } });

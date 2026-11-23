@@ -51,9 +51,9 @@ describe('diagnose:gemini CLI (end to end, local fake Gemini)', () => {
     const sdk = /@google\/genai (\S+) /.exec(out)?.[1];
     expect(sdk).toBe(packageVersion('@google/genai')); // the real version, not "unknown"
     expect(sdk).toMatch(/^\d+\.\d+\.\d+/);
-    expect(out).toContain('[1/5] Reaching Google');
-    expect(out).toContain('[4/5] The complete planning flow');
-    expect(out).toContain('[5/5] Diagnosis');
+    expect(out).toContain('[1/6] Reaching Google');
+    expect(out).toContain('[5/6] The complete planning flow');
+    expect(out).toContain('[6/6] Diagnosis');
     expect(out).toMatch(/FULL FLOW OK/);
     expect(out).not.toContain(KEY); // the key is never printed
     expect(code).toBe(0);

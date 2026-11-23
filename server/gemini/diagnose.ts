@@ -22,6 +22,7 @@ import { upstreamStatus } from '../lib/errors';
 import { redactSecrets, registerSecrets, upstreamReason } from '../lib/redact';
 import { partsText } from './call';
 import { pickNewestStableFlash } from './client';
+import { parseFallbackList, pickFallbacks } from './fallback';
 import { buildPlanSystemInstruction, buildPlanUserParts } from './prompts';
 import { preparePlanJob } from './plan';
 import { buildPlanJsonSchema } from './schema';
@@ -96,9 +97,18 @@ export interface DiagReport {
   reach: ReachResult[];
   minimal: { version: string; kind: 'generate' | 'stream'; timing: StreamTiming }[];
   plan: { variant: 'A' | 'B' | 'C'; label: string; thinking: ThinkingConfig | null; timing: StreamTiming }[];
+  /** Flash-family models this key can call (live list from Google). */
+  modelsListed: string[];
+  /** Where the fallback chain comes from. */
+  chainSource: 'auto' | 'GEMINI_MODEL_FALLBACKS' | 'disabled';
+  /** Real minimal request to each alternative the app would fall back to. */
+  alternatives: { model: string; timing: StreamTiming }[];
   flow: null | {
     ok: boolean;
     ms: number;
+    /** The model that wrote the plan (from the app's own run log), and whether the app fell back to it. */
+    model?: string;
+    fellBack?: boolean;
     events: { atMs: number; event: string; note?: string }[];
     error?: ApiError;
     logLines: string[];
@@ -343,6 +353,9 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
     modelSource: 'fallback',
     reach: [],
     minimal: [],
+    modelsListed: [],
+    chainSource: 'auto',
+    alternatives: [],
     plan: [],
     flow: null,
     verdict: [],
@@ -364,7 +377,7 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
   }
 
   // 1 + 2. Reachability, key and model availability on both API versions.
-  say('\n[1/5] Reaching Google and checking the key + model (raw HTTP, no SDK)');
+  say('\n[1/6] Reaching Google and checking the key + model (raw HTTP, no SDK)');
   for (const version of ['v1', 'v1beta']) {
     const r = await reach({ apiKey: o.apiKey, reachTimeoutMs: reachCap, base, model: report.model }, version);
     report.reach.push(r);
@@ -376,16 +389,19 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
   }
 
   // 3. Minimal real requests.
-  const reachable = report.reach.filter((r) => r.ok).map((r) => r.version);
+  // A version counts as reachable if Google ANSWERED with data, or with a temporary error (503 etc.):
+  // "overloaded" is not "unreachable", and the generation requests below may behave differently.
+  const temporary = (r: ReachResult) => r.status !== undefined && (r.status >= 500 || r.status === 429);
+  const reachable = report.reach.filter((r) => r.ok || temporary(r)).map((r) => r.version);
   if (reachable.length === 0) {
-    // Nothing else can work, so don't make the user wait through the remaining steps.
+    // Nothing else can work (no HTTP answer at all, or the key was rejected): don't make the user wait.
     say('\nStopping here: no later step can work until Google is reachable.');
     report.verdict = diagnose(report, o.firstChunkTimeoutMs ?? 30_000);
     say('\nDiagnosis');
     for (const line of report.verdict) say(`  ${line}`);
     return report;
   }
-  say(`\n[2/5] Minimal request to ${report.model} (“Reply with the single word OK.”)`);
+  say(`\n[2/6] Minimal request to ${report.model} (“Reply with the single word OK.”)`);
   const tiny: Request = { contents: [{ role: 'user', parts: [{ text: 'Reply with the single word OK.' }] }] };
   for (const version of reachable) {
     for (const kind of ['generate', 'stream'] as const) {
@@ -398,9 +414,35 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
     }
   }
 
+  // 3. The alternative models the app falls back to when the primary is temporarily unavailable (503).
+  say('\n[3/6] Alternative models: what the app falls back to if the primary returns 503');
+  const listed = await listNames(base, o.apiKey, 'v1beta', reachCap);
+  report.modelsListed = listed
+    .map((n) => n.replace(/^models\//, ''))
+    .filter((n) => /^gemini-.*flash/.test(n))
+    .sort();
+  say(`  Flash-family models this key can call: ${report.modelsListed.join(', ') || '(none listed)'}`);
+  const fb = parseFallbackList(process.env.GEMINI_MODEL_FALLBACKS);
+  report.chainSource =
+    fb.models === null ? 'auto' : fb.models.length === 0 ? 'disabled' : 'GEMINI_MODEL_FALLBACKS';
+  const chain =
+    fb.models === null
+      ? pickFallbacks(listed, report.model, 2)
+      : fb.models.filter((m) => m !== report.model).slice(0, 2);
+  say(
+    chain.length > 0
+      ? `  Fallback chain: ${[report.model, ...chain].join(' → ')}  (${report.chainSource === 'auto' ? 'picked automatically from that list' : 'from GEMINI_MODEL_FALLBACKS'})`
+      : `  Fallback chain: none (${report.chainSource === 'disabled' ? 'disabled by GEMINI_MODEL_FALLBACKS=none' : 'this key lists no other stable Flash model'})`,
+  );
+  for (const model of chain) {
+    const timing = await timeGenerate(mk(o.apiVersion), model, tiny, callCap);
+    report.alternatives.push({ model, timing });
+    say(`  ${model.padEnd(24)} ${timing.ok ? 'OK ' : 'FAIL'} ${timingLine(timing)}`);
+  }
+
   // 4. The REAL plan request with different thinking settings.
   if (!o.skipPlan) {
-    say('\n[3/5] The real plan request (this app’s prompt + schema) with different thinking settings');
+    say('\n[4/6] The real plan request (this app’s prompt + schema) with different thinking settings');
     const now = new Date();
     const deadline = new Date(now.getTime() + 35 * 86_400_000).toISOString().slice(0, 10);
     const job = preparePlanJob(
@@ -463,7 +505,7 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
 
   // 5. The complete flow through this app's own /api/plan route.
   if (!o.skipFlow && !o.skipPlan) {
-    say('\n[4/5] The complete planning flow through this app’s /api/plan route (SSE)');
+    say('\n[5/6] The complete planning flow through this app’s /api/plan route (SSE)');
     report.flow = await runFlow(o, report.model, say);
     say(
       `  ${report.flow.ok ? 'OK ' : 'FAIL'} ${sec(report.flow.ms)}${report.flow.error ? ` · ${report.flow.error.code}: ${report.flow.error.message}` : ''}`,
@@ -472,7 +514,7 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
   }
 
   report.verdict = diagnose(report, o.firstChunkTimeoutMs ?? 30_000);
-  say('\n[5/5] Diagnosis');
+  say('\n[6/6] Diagnosis');
   for (const line of report.verdict) say(`  ${line}`);
   return report;
 }
@@ -512,6 +554,7 @@ async function runFlow(
   const port = (server.address() as AddressInfo).port;
   let error: ApiError | undefined;
   let ok = false;
+  let usedModel: string | undefined;
   try {
     const deadline = new Date(Date.now() + 35 * 86_400_000).toISOString().slice(0, 10);
     const res = await fetch(`http://127.0.0.1:${port}/api/plan`, {
@@ -547,7 +590,12 @@ async function runFlow(
           if (!name || !data) continue;
           const ev = { event: name, data: JSON.parse(data) } as PlanStreamEvent;
           const atMs = performance.now() - t0;
-          if (ev.event === 'status') events.push({ atMs, event: `status:${ev.data.phase}` });
+          if (ev.event === 'status')
+            events.push({
+              atMs,
+              event: `status:${ev.data.phase}`,
+              ...(/Trying /.test(ev.data.message) ? { note: ev.data.message } : {}),
+            });
           else if (ev.event === 'milestone')
             events.push({
               atMs,
@@ -556,10 +604,11 @@ async function runFlow(
             });
           else if (ev.event === 'result') {
             ok = true;
+            usedModel = ev.data.runs.at(-1)?.model;
             events.push({
               atMs,
               event: 'result',
-              note: `${ev.data.plan.milestones.length} milestones, ${ev.data.checks.filter((c) => c.ok).length}/${ev.data.checks.length} code checks passed`,
+              note: `${ev.data.plan.milestones.length} milestones, ${ev.data.checks.filter((c) => c.ok).length}/${ev.data.checks.length} code checks passed, written by ${usedModel ?? 'unknown'}`,
             });
           } else if (ev.event === 'error') {
             error = ev.data;
@@ -575,7 +624,15 @@ async function runFlow(
   for (const e of events.slice(0, 14))
     say(`    +${sec(e.atMs).padStart(7)}  ${e.event}${e.note ? ` — ${e.note}` : ''}`);
   for (const l of logLines) say(`    log ${l}`);
-  return { ok, ms: performance.now() - t0, events, error, logLines };
+  return {
+    ok,
+    ms: performance.now() - t0,
+    model: usedModel,
+    fellBack: events.some((e) => /Trying /.test(e.note ?? '')),
+    events,
+    error,
+    logLines,
+  };
 }
 
 // ───────────────────────────── verdict (pure; unit-tested) ─────────────────────────────
@@ -586,7 +643,15 @@ export function diagnose(r: DiagReport, firstChunkLimitMs = 30_000): string[] {
   const okReach = r.reach.filter((x) => x.ok);
   const stalledNet = (t: StreamTiming) => !t.ok && t.stalledIn === 'waiting-for-http-response' && t.timedOut;
 
-  if (okReach.length === 0) {
+  const listUnavailable = r.reach.find(
+    (x) => !x.ok && x.status !== undefined && (x.status >= 500 || x.status === 429),
+  );
+  if (okReach.length === 0 && listUnavailable) {
+    // Google answered, just not with data. Say that, then keep diagnosing with the remaining measurements.
+    out.push(
+      `GOOGLE UNAVAILABLE: even listing models returned HTTP ${listUnavailable.status}${listUnavailable.reason ? ` (${listUnavailable.reason})` : ''}. The API is reachable but temporarily overloaded or down; this is not your key, network or this app.`,
+    );
+  } else if (okReach.length === 0) {
     const auth = r.reach.find((x) => x.status === 400 || x.status === 401 || x.status === 403);
     if (auth) {
       out.push(
@@ -661,10 +726,38 @@ export function diagnose(r: DiagReport, firstChunkLimitMs = 30_000): string[] {
       );
   }
 
+  // Google answered 503: temporary capacity trouble on ITS side. Say so, and say whether the fallback chain works.
+  const all503 = [...r.minimal.map((m) => m.timing), ...r.plan.map((p) => p.timing)].find(
+    (t) => t.status === 503,
+  );
+  if (all503) {
+    out.push(
+      `OVERLOADED: Google answered HTTP 503 for ${r.model} (${all503.reason ?? 'UNAVAILABLE'}). That is temporary capacity trouble on Google's side, not your key, your network or this app.`,
+    );
+    const working = r.alternatives.find((a) => a.timing.ok);
+    if (working) {
+      out.push(
+        `FALLBACK READY: ${working.model} answered in ${sec(working.timing.totalMs)} while ${r.model} was unavailable. The app switches to it automatically (after one retry on ${r.model}).`,
+      );
+    } else if (r.alternatives.length > 0) {
+      out.push(
+        `NO WORKING ALTERNATIVE right now: ${r.alternatives.map((a) => `${a.model} (${a.timing.status ? `HTTP ${a.timing.status}` : (a.timing.error ?? 'no answer')})`).join(', ')}. Wait a few minutes and re-run, or set GEMINI_MODEL_FALLBACKS to other models from the list above.`,
+      );
+    } else {
+      out.push(
+        r.chainSource === 'disabled'
+          ? 'NO ALTERNATIVE: fallbacks are disabled (GEMINI_MODEL_FALLBACKS=none).'
+          : listUnavailable
+            ? 'NO ALTERNATIVE KNOWN: the model list itself is unavailable right now, so alternatives could not be chosen. Set GEMINI_MODEL_FALLBACKS=<model>,<model> in .env to name them yourself.'
+            : 'NO ALTERNATIVE MODEL: this key lists no other stable Flash model. Set GEMINI_MODEL_FALLBACKS to a model you can use.',
+      );
+    }
+  }
+
   if (r.flow) {
     if (r.flow.ok)
       out.push(
-        `FULL FLOW OK: the planning flow of this app finished in ${sec(r.flow.ms)} and passed the code checks.`,
+        `FULL FLOW OK: the planning flow of this app finished in ${sec(r.flow.ms)} and passed the code checks${r.flow.model ? `, written by ${r.flow.model}${r.flow.fellBack ? ' after falling back from the primary model' : ''}` : ''}.`,
       );
     else
       out.push(

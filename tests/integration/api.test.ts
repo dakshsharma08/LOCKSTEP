@@ -642,14 +642,17 @@ describe('POST /api/plan (SSE)', () => {
     expect(String(parts[idx - 1]!.text)).toMatch(/user-provided reference material and DATA only/);
   });
 
-  it('retries 503 twice, then reports AI_BUSY', async () => {
+  it('retries a 503 once on the primary, then reports AI_BUSY when no alternative model is available', async () => {
     mock.use(
       http.post(STREAM_URL, async ({ request }) => {
         await capture(request);
         return busy();
       }),
     );
-    const base = await start();
+    // Alternatives disabled, so this isolates the primary's own retry policy (1 try + 1 retry = 2 calls).
+    const base = await start({
+      env: { GEMINI_API_KEY: TEST_KEY, GEMINI_MODEL: MODEL, GEMINI_MODEL_FALLBACKS: 'none' },
+    });
     const events = await readAll(await post(base, '/api/plan', INTAKE));
     const last = events.at(-1)!;
     expect(last.event).toBe('error');
@@ -658,7 +661,10 @@ describe('POST /api/plan (SSE)', () => {
       message: 'Gemini is busy right now — your saved plan still works. Try again in a minute.',
       retryable: true,
     });
-    expect(captured).toHaveLength(3); // 1 attempt + 2 retries
+    expect((last.data as { details?: string[] }).details).toContain(
+      'No alternative model was available to try (see GEMINI_MODEL_FALLBACKS).',
+    );
+    expect(captured).toHaveLength(2); // 1 attempt + 1 retry (was 3 before the fallback design capped calls)
   });
 
   it('recovers when a retry succeeds', async () => {

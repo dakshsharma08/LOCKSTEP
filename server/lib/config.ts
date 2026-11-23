@@ -14,6 +14,8 @@ export interface ServerConfig {
   model: string | null;
   /** Optional "Pro" model used for coach replanning (GEMINI_MODEL_HEAVY). */
   heavyModel: string | null;
+  /** GEMINI_MODEL_FALLBACKS: comma-separated alternatives, "none" to disable, empty = pick automatically. */
+  fallbackModels: string | null;
   /** GEMINI_API_VERSION (v1 | v1beta | v1alpha). null = the SDK's own default. */
   apiVersion: string | null;
   /** GEMINI_THINKING_LEVEL for plan generation (see gemini/thinking.ts). */
@@ -37,6 +39,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): ServerConfig {
     geminiApiKey: clean(env.GEMINI_API_KEY),
     model: clean(env.GEMINI_MODEL),
     heavyModel: clean(env.GEMINI_MODEL_HEAVY),
+    fallbackModels: clean(env.GEMINI_MODEL_FALLBACKS),
     apiVersion: /^v1(alpha|beta)?$/.test(clean(env.GEMINI_API_VERSION) ?? '')
       ? clean(env.GEMINI_API_VERSION)
       : null,
@@ -73,6 +76,8 @@ export interface AiTuning {
   /** How long the auto-picked model name is cached. */
   modelCacheMs: number;
   rateLimit: { windowSec: number; windowMax: number; dayMax: number };
+  /** Limits for trying alternative models when the primary is temporarily unavailable (see gemini/fallback.ts). */
+  modelFallback: { primaryRetries: number; maxAttempts: number; maxFallbacks: number };
 }
 
 export const DEFAULT_TUNING: AiTuning = {
@@ -86,12 +91,20 @@ export const DEFAULT_TUNING: AiTuning = {
   keepAliveMs: 15_000,
   modelCacheMs: 60 * 60 * 1000,
   rateLimit: { windowSec: 10 * 60, windowMax: 20, dayMax: 150 },
+  // 1 call + 1 retry on the primary, then at most 2 alternatives: 4 upstream calls in the worst case.
+  modelFallback: { primaryRetries: 1, maxAttempts: 4, maxFallbacks: 2 },
 };
 
-export type TuningOverrides = Partial<Omit<AiTuning, 'rateLimit'>> & {
+export type TuningOverrides = Partial<Omit<AiTuning, 'rateLimit' | 'modelFallback'>> & {
   rateLimit?: Partial<AiTuning['rateLimit']>;
+  modelFallback?: Partial<AiTuning['modelFallback']>;
 };
 
 export function resolveTuning(over: TuningOverrides = {}): AiTuning {
-  return { ...DEFAULT_TUNING, ...over, rateLimit: { ...DEFAULT_TUNING.rateLimit, ...over.rateLimit } };
+  return {
+    ...DEFAULT_TUNING,
+    ...over,
+    rateLimit: { ...DEFAULT_TUNING.rateLimit, ...over.rateLimit },
+    modelFallback: { ...DEFAULT_TUNING.modelFallback, ...over.modelFallback },
+  };
 }

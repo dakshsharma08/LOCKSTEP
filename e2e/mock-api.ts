@@ -120,7 +120,15 @@ function json(obj: unknown) {
   });
 }
 
+const LIST = /^https:\/\/generativelanguage\.googleapis\.com\/v1[a-z0-9]*\/models(\?.*)?$/;
+
 const mock = setupServer(
+  // The app lists the key's models in the background (for fallbacks); answer it here so tests stay offline.
+  http.get(LIST, () =>
+    HttpResponse.json({
+      models: [{ name: 'models/gemini-e2e-mock', supportedGenerationMethods: ['generateContent'] }],
+    }),
+  ),
   http.post(STREAM, async ({ request }) => sse(JSON.stringify(fixturePlan((await request.json()) as Body)))),
   http.post(GENERATE, async ({ request }) => {
     const body = (await request.json()) as Body & { tools?: unknown };

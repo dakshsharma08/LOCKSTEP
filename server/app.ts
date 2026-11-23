@@ -28,6 +28,7 @@ import { AppError } from './lib/errors';
 import { createRateLimiter, rateLimitMiddleware, rulesFrom } from './lib/rateLimit';
 
 import { createAccountRouter } from './account';
+import { parseFallbackList } from './gemini/fallback';
 import { parsePlanThinking } from './gemini/thinking';
 import { ImageModelResolver } from './gemini/background';
 import { createWallpaperRouter, storeFromEnv, type WallpaperStore } from './wallpaper/living';
@@ -51,6 +52,17 @@ export function createApp(opts: CreateAppOptions = {}): Express {
   const config = loadConfig(env);
   registerSecrets([config.geminiApiKey, config.supabase?.serviceKey, config.upstash?.token]);
   const tuning = resolveTuning(opts.tuning);
+  const fallbackCfg = parseFallbackList(config.fallbackModels);
+  if (fallbackCfg.rejected.length > 0) {
+    console.warn(
+      JSON.stringify({
+        type: 'config_warning',
+        setting: 'GEMINI_MODEL_FALLBACKS',
+        ignored: fallbackCfg.rejected,
+        reason: 'not a plain model name',
+      }),
+    );
+  }
   const now = opts.now ?? (() => new Date());
 
   // No key → no client. The AI routes then answer 503 AI_NOT_CONFIGURED; we never fake AI output.
@@ -64,6 +76,8 @@ export function createApp(opts: CreateAppOptions = {}): Express {
         pinned: config.model,
         heavy: config.heavyModel,
         cacheMs: tuning.modelCacheMs,
+        fallbacks: fallbackCfg.models,
+        maxFallbacks: tuning.modelFallback.maxFallbacks,
       })
     : null;
 

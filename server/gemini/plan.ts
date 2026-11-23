@@ -27,6 +27,7 @@ import {
 import { dayKey, localToUtcIso, type DstAdjustment } from '../../shared/time';
 import { AppError } from '../lib/errors';
 import { streamGemini, type CallContext } from './call';
+import { runWithFallback, type ModelPool } from './fallback';
 import { isThinkingRejection, planThinkingConfig, thinkingFallbacks, type PlanThinking } from './thinking';
 import { buildPlanSystemInstruction, buildPlanUserParts } from './prompts';
 import { repairPlan } from './repair';
@@ -103,7 +104,7 @@ function validateText(
 export async function generatePlan(
   call: CallContext,
   job: PlanJob,
-  model: string,
+  pool: ModelPool,
   emit: (e: PlanStreamEvent) => void,
   opts: { thinking?: PlanThinking } = {},
 ): Promise<PlanResult> {
@@ -118,57 +119,80 @@ export async function generatePlan(
 
   emit({ event: 'status', data: { phase: 'thinking', message: 'Gemini is thinking about your plan…' } });
 
-  // Plan generation asks for a LOW thinking level (see gemini/thinking.ts). If Google rejects the
-  // thinking settings for this model/API version, retry once with plainer settings rather than
-  // failing the whole plan; the rejection and the retry are both logged.
-  const configs = thinkingFallbacks(planThinkingConfig(model, opts.thinking));
-  let text = '';
-  for (let i = 0; i < configs.length; i++) {
-    const thinkingConfig = configs[i];
-    const parser = new PlanStreamParser(); // a fresh parser per attempt
-    try {
-      text = await streamGemini(call, {
-        kind: 'plan',
-        model,
-        request: {
-          contents: [{ role: 'user', parts: buildPlanUserParts(job.intake) }],
-          config: {
-            systemInstruction,
-            responseMimeType: 'application/json',
-            responseJsonSchema,
-            ...(thinkingConfig ? { thinkingConfig } : {}),
-          },
-        },
-        onFirstChunk: () =>
-          emit({ event: 'status', data: { phase: 'streaming', message: 'Writing your milestones…' } }),
-        onText: (delta) => {
-          for (const ev of parser.push(delta)) {
-            if (ev.type === 'feasibility') {
-              emit({
-                event: 'feasibility',
-                data: { feasibility: ev.feasibility, feasibilityReason: ev.feasibilityReason },
-              });
-            } else {
-              emit({ event: 'milestone', data: { index: ev.index, milestone: ev.milestone } });
-            }
-          }
-        },
-      });
-      break;
-    } catch (err) {
-      if (i < configs.length - 1 && isThinkingRejection(err)) {
-        call.recorder.diag({
-          event: 'thinking_fallback',
+  /**
+   * Stream the plan from ONE model. Plan generation asks for a LOW thinking level (see gemini/thinking.ts);
+   * if Google rejects the thinking settings for this model/API version, retry once with plainer settings
+   * rather than failing the whole plan (the rejection and the retry are both logged).
+   */
+  const streamFrom = async (model: string, retries: number): Promise<string> => {
+    const configs = thinkingFallbacks(planThinkingConfig(model, opts.thinking));
+    for (let i = 0; i < configs.length; i++) {
+      const thinkingConfig = configs[i];
+      const parser = new PlanStreamParser(); // a fresh parser per attempt
+      try {
+        return await streamGemini(call, {
           kind: 'plan',
           model,
-          from: thinkingConfig ?? null,
-          to: configs[i + 1] ?? null,
+          retries,
+          request: {
+            contents: [{ role: 'user', parts: buildPlanUserParts(job.intake) }],
+            config: {
+              systemInstruction,
+              responseMimeType: 'application/json',
+              responseJsonSchema,
+              ...(thinkingConfig ? { thinkingConfig } : {}),
+            },
+          },
+          onFirstChunk: () =>
+            emit({ event: 'status', data: { phase: 'streaming', message: 'Writing your milestones…' } }),
+          onText: (delta) => {
+            for (const ev of parser.push(delta)) {
+              if (ev.type === 'feasibility') {
+                emit({
+                  event: 'feasibility',
+                  data: { feasibility: ev.feasibility, feasibilityReason: ev.feasibilityReason },
+                });
+              } else {
+                emit({ event: 'milestone', data: { index: ev.index, milestone: ev.milestone } });
+              }
+            }
+          },
         });
-        continue;
+      } catch (err) {
+        if (i < configs.length - 1 && isThinkingRejection(err)) {
+          call.recorder.diag({
+            event: 'thinking_fallback',
+            kind: 'plan',
+            model,
+            from: thinkingConfig ?? null,
+            to: configs[i + 1] ?? null,
+          });
+          continue;
+        }
+        throw err;
       }
-      throw err;
     }
-  }
+    throw new AppError('INTERNAL'); // unreachable: the last config either returns or throws
+  };
+
+  // The primary model first; if it is TEMPORARILY unavailable (503 "high demand", 429, 5xx, no answer),
+  // a small, capped number of alternatives (see gemini/fallback.ts). Everything after this point
+  // (validation, repair, feasibility) is identical whichever model produced the plan.
+  const { value: text, model } = await runWithFallback(pool, streamFrom, {
+    onFallback: ({ from, to, error }) => {
+      call.recorder.diag({
+        event: 'model_fallback',
+        kind: 'plan',
+        from,
+        to,
+        reason: error instanceof AppError ? (error.details ?? [error.message]).join(' | ') : 'unknown',
+      });
+      emit({
+        event: 'status',
+        data: { phase: 'thinking', message: `Gemini is busy right now. Trying ${to} instead…` },
+      });
+    },
+  });
 
   emit({ event: 'status', data: { phase: 'validating', message: 'Checking dates, order and hours…' } });
   let validation = validateText(text, job.ctx);
