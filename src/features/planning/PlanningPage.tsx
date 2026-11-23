@@ -5,11 +5,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router';
 import { AnimatePresence, motion } from 'framer-motion';
-import { AlertTriangle, PenLine, RotateCcw, Sparkles, X } from 'lucide-react';
+import { AlertTriangle, ListChecks, PenLine, RotateCcw, Sparkles, X } from 'lucide-react';
+import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { FeasibilityBadge } from '@/components/ui/badges';
 import { useGoal } from '@/db/hooks';
-import { savePlanResult, startManualPlan } from '@/db/repo';
+import { savePlanResult, saveStarterPlan, startManualPlan } from '@/db/repo';
 import { ApiCallError, streamPlan } from '@/lib/api';
 import { usePlanner } from '@/stores/planner';
 import { shortDate } from '@/lib/metrics';
@@ -124,6 +125,19 @@ export default function PlanningPage() {
     if (!goal) return;
     await startManualPlan(goal.id);
     navigate(`/goals/${goal.id}/review`);
+  }
+
+  /** Gemini can't plan right now: start from a rule-based starter plan (labelled as such, never as AI). */
+  async function buildFromStarter() {
+    if (!goal) return;
+    if (await saveStarterPlan(goal.id)) {
+      navigate(`/goals/${goal.id}/review`);
+      return;
+    }
+    toast.error(
+      'No working day is left before the deadline, so there is no starter plan. Build it yourself.',
+    );
+    await buildManually();
   }
 
   if (goal === undefined)
@@ -260,6 +274,13 @@ export default function PlanningPage() {
                 Retry
               </Button>
             )}
+            <Button
+              variant="secondary"
+              onClick={() => void buildFromStarter()}
+              icon={<ListChecks className="size-4" strokeWidth={1.5} />}
+            >
+              Use a starter plan (no AI)
+            </Button>
             <Button
               variant={error.code === 'AI_NOT_CONFIGURED' ? 'primary' : 'ghost'}
               onClick={() => void buildManually()}

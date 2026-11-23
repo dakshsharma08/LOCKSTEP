@@ -56,6 +56,8 @@ export interface HealthResponse {
   ai: {
     configured: boolean;
     model: string | null; // resolved default model (null until resolved / when not configured)
+    /** Gemini API version the server calls: GEMINI_API_VERSION, else the SDK's default (v1). */
+    apiVersion: string;
     heavyModel: string | null;
     imageModel: string | null; // only set when an image-capable model is confirmed to work
   };

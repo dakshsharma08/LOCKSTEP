@@ -15,7 +15,16 @@ import {
   type AiRunRow,
 } from './db';
 import type { AiRunMeta, PlanResult, RescheduleChange } from '@shared/api';
-import { computeCapacity, feasibilityFor, round1, suggestFixes, type Difficulty } from '@shared/plan';
+import {
+  computeCapacity,
+  feasibilityFor,
+  round1,
+  suggestFixes,
+  validatePlan,
+  type Difficulty,
+  type Plan,
+} from '@shared/plan';
+import { buildStarterPlan } from '@shared/starterPlan';
 import { dayKey, localToUtcIso } from '@shared/time';
 
 // ───────────────────────── Goals ─────────────────────────
@@ -92,48 +101,106 @@ export async function savePlanResult(goalId: string, result: PlanResult): Promis
   };
   await db.transaction('rw', [db.goals, db.milestones, db.tasks, db.ai_runs], async () => {
     await clearPlan(goalId);
-    const milestones: MilestoneRow[] = [];
-    const tasks: TaskRow[] = [];
-    result.plan.milestones.forEach((m, i) => {
-      const mid = uid();
-      milestones.push({
-        id: mid,
-        goal_id: goalId,
-        title: m.title,
-        description: m.description,
-        target_date: m.targetDate,
-        estimated_hours: m.estimatedHours,
-        difficulty: m.difficulty,
-        order: i,
-        source: 'ai',
-        edited: false,
-        status: 'pending',
-        approved_at: null,
-        completed_at: null,
-        created_at: now,
-        updated_at: now,
-      });
-      m.tasks.forEach((t, j) =>
-        tasks.push({
-          id: uid(),
-          milestone_id: mid,
-          goal_id: goalId,
-          title: t.title,
-          estimated_minutes: t.estimatedMinutes,
-          order: j,
-          source: 'ai',
-          edited: false,
-          done_at: null,
-          created_at: now,
-          updated_at: now,
-        }),
-      );
-    });
+    const { milestones, tasks } = planRows(goalId, result.plan, 'ai', now);
     await db.milestones.bulkAdd(milestones);
     await db.tasks.bulkAdd(tasks);
     await db.goals.update(goalId, { plan_meta: meta, status: 'review', updated_at: now });
     await recordRuns(result.runs, goalId);
   });
+}
+
+/** Milestone and task rows for a plan (Gemini's, or a starter plan with source 'user'). */
+function planRows(goalId: string, plan: Plan, source: 'ai' | 'user', now: string) {
+  const milestones: MilestoneRow[] = [];
+  const tasks: TaskRow[] = [];
+  plan.milestones.forEach((m, i) => {
+    const mid = uid();
+    milestones.push({
+      id: mid,
+      goal_id: goalId,
+      title: m.title,
+      description: m.description,
+      target_date: m.targetDate,
+      estimated_hours: m.estimatedHours,
+      difficulty: m.difficulty,
+      order: i,
+      source,
+      edited: false,
+      status: 'pending',
+      approved_at: null,
+      completed_at: null,
+      created_at: now,
+      updated_at: now,
+    });
+    m.tasks.forEach((t, j) =>
+      tasks.push({
+        id: uid(),
+        milestone_id: mid,
+        goal_id: goalId,
+        title: t.title,
+        estimated_minutes: t.estimatedMinutes,
+        order: j,
+        source,
+        edited: false,
+        done_at: null,
+        created_at: now,
+        updated_at: now,
+      }),
+    );
+  });
+  return { milestones, tasks };
+}
+
+/**
+ * Save a STARTER PLAN made by LOCKSTEP's rules, with no AI (offered when Gemini can't plan right now).
+ * It is a 'manual' plan marked with starterAt, so it is never shown as Gemini's work, and it must pass the
+ * same code checks as a Gemini plan. Returns false when no starter plan is possible (no working day left).
+ */
+export async function saveStarterPlan(goalId: string): Promise<boolean> {
+  const goal = await db.goals.get(goalId);
+  if (!goal) return false;
+  const ctx = {
+    todayKey: dayKey(Date.now(), goal.timezone),
+    deadlineUtc: goal.deadline_utc,
+    timezone: goal.timezone,
+    hoursPerDay: goal.hours_per_day,
+    workingDays: goal.working_days,
+  };
+  const v = validatePlan(buildStarterPlan({ goal: goal.title, pace: goal.pace_style }, ctx), ctx);
+  if (!v.ok || !v.plan) return false;
+  const plan = v.plan;
+  const now = nowIso();
+  await db.transaction('rw', [db.goals, db.milestones, db.tasks], async () => {
+    await clearPlan(goalId);
+    const { milestones, tasks } = planRows(goalId, plan, 'user', now);
+    await db.milestones.bulkAdd(milestones);
+    await db.tasks.bulkAdd(tasks);
+    const base: PlanMeta = {
+      source: 'manual',
+      starterAt: now,
+      modelFeasibility: null,
+      modelReason: null,
+      code: v.code,
+      agrees: true,
+      checks: [],
+      capacity: v.capacity,
+      fixes: null,
+      risks: plan.risks,
+      recoveryStrategy: plan.recoveryStrategy,
+      dailyRitual: plan.dailyRitual,
+      totalEstimatedHours: plan.totalEstimatedHours,
+      fullScopeHours: null,
+      generatedAt: null,
+      model: null,
+      repaired: false,
+    };
+    await db.goals.update(goalId, {
+      plan_meta: recomputeMeta(goal, milestones, base, tasks),
+      status: 'review',
+      updated_at: now,
+    });
+  });
+  return true;
 }
 
 /** Start an empty plan the user fills in by hand (used when AI is unavailable). */
@@ -214,6 +281,7 @@ export function recomputeMeta(
     generatedAt: prev?.generatedAt ?? null,
     model: prev?.model ?? null,
     repaired: prev?.repaired ?? false,
+    ...(prev?.starterAt ? { starterAt: prev.starterAt } : {}),
   };
 }
 

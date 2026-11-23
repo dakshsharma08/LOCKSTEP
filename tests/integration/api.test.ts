@@ -421,6 +421,7 @@ describe('GET /api/health', () => {
     expect(a.ai).toEqual({
       configured: true,
       model: 'gemini-3.8-flash',
+      apiVersion: 'v1', // GEMINI_API_VERSION is not set: the SDK default
       heavyModel: 'gemini-test-pro',
       imageModel: 'gemini-3.10-flash-image',
     });
@@ -453,6 +454,12 @@ describe('GET /api/health', () => {
     const base = await start({ env: { GEMINI_API_KEY: TEST_KEY, GEMINI_MODEL: 'gemini-3.5-flash' } });
     const body = (await (await fetch(`${base}/api/health`)).json()) as HealthResponse;
     expect(body.ai.model).toBe('gemini-3.5-flash');
+  });
+
+  it('reports the Gemini API version: GEMINI_API_VERSION when set (so a deployment can be checked)', async () => {
+    const base = await start({ env: { GEMINI_API_KEY: TEST_KEY, GEMINI_API_VERSION: 'v1beta' } });
+    const body = (await (await fetch(`${base}/api/health`)).json()) as HealthResponse;
+    expect(body.ai.apiVersion).toBe('v1beta');
   });
 
   it('uses the default model when listing fails (not the alias, which can point at an exhausted model)', async () => {

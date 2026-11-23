@@ -179,7 +179,9 @@ export default function ReviewPage() {
       {meta?.source === 'ai' && <GeneratedStamp className="mt-2" model={meta.model} at={meta.generatedAt} />}
       {meta?.source === 'manual' && (
         <p className="mt-2 text-xs text-muted">
-          Built by you{meta.generatedAt ? ' (started from a Gemini plan)' : ''}.
+          {meta.starterAt
+            ? 'Starter plan made by LOCKSTEP’s rules, not by Gemini. Edit anything to make it yours.'
+            : `Built by you${meta.generatedAt ? ' (started from a Gemini plan)' : ''}.`}
         </p>
       )}
 
@@ -232,6 +234,7 @@ export default function ReviewPage() {
                   index={i}
                   milestone={m}
                   tasks={tasksFor(m.id)}
+                  starterAt={meta?.starterAt ?? null}
                   issues={checks!.byId.get(m.id)}
                   onEdit={() => setEditing(m)}
                   onDelete={() => void remove(m)}
@@ -456,6 +459,7 @@ function FeasibilityPanel({
 function SortableMilestone({
   milestone: m,
   tasks,
+  starterAt,
   issues,
   index,
   onEdit,
@@ -463,6 +467,8 @@ function SortableMilestone({
 }: {
   milestone: MilestoneRow;
   tasks: TaskRow[];
+  /** When this is a starter plan: its rows' created_at (they say "Starter", not "Added by you"). */
+  starterAt: string | null;
   issues?: MilestoneIssues;
   index: number;
   onEdit: () => void;
@@ -511,7 +517,11 @@ function SortableMilestone({
               <AiBadge />
             ) : null}
             {m.edited && <EditedBadge />}
-            {m.source === 'user' && !m.edited && <span className="text-[11px] text-muted">Added by you</span>}
+            {m.source === 'user' && !m.edited && (
+              <span className="text-[11px] text-muted">
+                {starterAt && m.created_at === starterAt ? 'Starter (no AI)' : 'Added by you'}
+              </span>
+            )}
           </div>
           <h3 className="mt-2 font-sans text-base font-semibold leading-snug">{m.title}</h3>
           {m.description && <p className="mt-1 text-sm text-muted">{m.description}</p>}

@@ -154,6 +154,7 @@ export function createApp(opts: CreateAppOptions = {}): Express {
       now,
       limiter,
       health: new ModelHealth(tuning.cooldown),
+      apiVersion: config.apiVersion,
       motivationCache: new MotivationCache(),
       planThinking: parsePlanThinking(config.planThinking),
       images: models

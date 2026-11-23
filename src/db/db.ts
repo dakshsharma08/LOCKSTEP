@@ -54,6 +54,11 @@ export interface PlanMeta {
   generatedAt: string | null;
   model: string | null;
   repaired: boolean;
+  /**
+   * Set when the plan is a STARTER PLAN made by LOCKSTEP's rules without AI (shared/starterPlan.ts): the
+   * created_at of its rows, so they are labelled "Starter" (never as Gemini's) until edited.
+   */
+  starterAt?: string | null;
 }
 
 export interface GoalRow {

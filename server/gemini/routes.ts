@@ -44,6 +44,8 @@ export interface AiDeps {
   tuning: AiTuning;
   /** Per-model cooldown shared by all AI requests of this app (gemini/modelHealth.ts). */
   health?: ModelHealth;
+  /** GEMINI_API_VERSION when set (null = the SDK's default, v1 in @google/genai 3.x). */
+  apiVersion?: string | null;
   now: () => Date;
   limiter: RateLimiter;
   motivationCache: MotivationCache;
@@ -117,6 +119,7 @@ export function createAiRouter(deps: AiDeps): Router {
       ai: {
         configured: !!deps.gemini,
         model,
+        apiVersion: deps.apiVersion ?? 'v1',
         heavyModel: deps.models?.heavy ?? null,
         imageModel: deps.images ? await deps.images.resolve() : null,
       },
