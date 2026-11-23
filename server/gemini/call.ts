@@ -16,8 +16,9 @@ import type { AiKind, AiRunMeta } from '../../shared/api';
 import type { RunRecorder } from '../lib/aiRuns';
 import { runMeta } from '../lib/aiRuns';
 import type { AiTuning } from '../lib/config';
-import { AppError, isRetryableUpstream, toAppError } from '../lib/errors';
+import { AppError, isRetryableUpstream, toAppError, upstreamStatus } from '../lib/errors';
 import { withRetry } from '../lib/retry';
+import { upstreamReason } from '../lib/redact';
 import { raceAbort, timeoutError, withTimeout } from '../lib/timeout';
 import type { GeminiLike } from './client';
 
@@ -117,6 +118,14 @@ export async function callGemini(ctx: CallContext, args: CallArgs): Promise<Gene
           return response;
         } catch (err) {
           record(ctx, runMeta(args.kind, args.model, started, false, null));
+          ctx.recorder.diag({
+            kind: args.kind,
+            model: args.model,
+            ok: false,
+            streaming: false,
+            totalMs: Date.now() - started,
+            ...failureInfo(err),
+          });
           throw err;
         }
       },
@@ -134,6 +143,67 @@ export async function callGemini(ctx: CallContext, args: CallArgs): Promise<Gene
   const blocked = blockReason(response);
   if (blocked) throw blockedError(blocked);
   return response;
+}
+
+/**
+ * HTTP status of an error that came FROM Google. Our own AppError also has a `.status` (the HTTP
+ * status we would answer with, e.g. 504 for a timeout), so it must not be mistaken for Google's.
+ */
+const googleStatus = (err: unknown): number | undefined =>
+  err instanceof AppError ? undefined : upstreamStatus(err);
+
+/** What we log about a failed upstream call: HTTP status and Google's own (redacted) reason. */
+function failureInfo(err: unknown): Record<string, unknown> {
+  const status = googleStatus(err);
+  return {
+    ...(status !== undefined ? { status, upstream: upstreamReason(err) } : {}),
+    error: err instanceof AppError ? err.code : err instanceof Error ? err.name : 'unknown',
+  };
+}
+
+/** Where the time went in one streaming attempt (milliseconds since the request was sent). */
+interface Phases {
+  /** HTTP response headers received (Google accepted the request). */
+  headersMs?: number;
+  /** First SSE chunk of any kind (a thought summary counts). */
+  firstChunkMs?: number;
+  /** First chunk that carried visible text (the JSON we parse). */
+  firstTextMs?: number;
+  chunks: number;
+  thoughtChunks: number;
+}
+
+type StallPhase = 'waiting-for-http-response' | 'waiting-for-first-chunk' | 'streaming';
+const stallPhase = (ph: Phases): StallPhase =>
+  ph.headersMs === undefined
+    ? 'waiting-for-http-response'
+    : ph.firstChunkMs === undefined
+      ? 'waiting-for-first-chunk'
+      : 'streaming';
+
+/**
+ * The first-chunk timeout, worded by WHICH wait timed out. "No first chunk" alone hides the
+ * difference between "Google never answered" (network) and "Google answered but the model
+ * is still thinking" (model latency); they need different fixes.
+ */
+function firstChunkTimeout(phase: StallPhase, ms: number): AppError {
+  const s = Math.round(ms / 1000);
+  if (phase === 'waiting-for-http-response') {
+    return new AppError('TIMEOUT', `Google didn't answer the request within ${s} s.`, {
+      details: [
+        'phase: waiting-for-http-response (no HTTP response from generativelanguage.googleapis.com)',
+        'This points at the network between this server and Google (proxy, firewall, VPN, DNS or IPv6), not at the model.',
+        'Run `npm run diagnose:gemini` to test the connection directly.',
+      ],
+    });
+  }
+  return new AppError('TIMEOUT', `Gemini accepted the request but sent no output within ${s} s.`, {
+    details: [
+      'phase: waiting-for-first-chunk (HTTP response received, no data yet)',
+      'The model is most likely still "thinking". Lower it with GEMINI_THINKING_LEVEL=low (or minimal).',
+      'Run `npm run diagnose:gemini` to measure it.',
+    ],
+  });
 }
 
 export interface StreamArgs extends CallArgs {
@@ -155,6 +225,8 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
   );
 
   let started = Date.now();
+  let attempts = 0;
+  let ph: Phases = { chunks: 0, thoughtChunks: 0 };
   let lastUsage: GenerateContentResponse | undefined;
   let text = '';
   let attemptSignal: AbortSignal = total;
@@ -162,27 +234,47 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
   // `as` widens the type: TypeScript can't see the assignment inside consume().
   let blocked = null as string | null;
   const consume = (chunk: GenerateContentResponse) => {
+    ph.chunks++;
+    if (chunk.candidates?.[0]?.content?.parts?.some((p) => p.thought)) ph.thoughtChunks++;
     if (chunk.usageMetadata) lastUsage = chunk;
     blocked = blockReason(chunk) ?? blocked;
     const delta = responseText(chunk);
     if (delta) {
+      ph.firstTextMs ??= Date.now() - started;
       text += delta;
       args.onText(delta);
     }
   };
+
+  /** One structured log line about how this call went (timings by phase, HTTP status, Google's reason). */
+  const diag = (ok: boolean, extra: Record<string, unknown> = {}) =>
+    ctx.recorder.diag({
+      kind: args.kind,
+      model: args.model,
+      ok,
+      streaming: true,
+      attempts,
+      ...(ph.headersMs !== undefined ? { headersMs: ph.headersMs } : {}),
+      ...(ph.firstChunkMs !== undefined ? { firstChunkMs: ph.firstChunkMs } : {}),
+      ...(ph.firstTextMs !== undefined ? { firstTextMs: ph.firstTextMs } : {}),
+      chunks: ph.chunks,
+      thoughtChunks: ph.thoughtChunks,
+      totalMs: Date.now() - started,
+      thinking: args.request.config?.thinkingConfig ?? null,
+      ...extra,
+    });
 
   try {
     // Phase 1 (retryable): open the stream and wait for the first chunk.
     const { stream, attemptCtrl } = await withRetry(
       async () => {
         started = Date.now();
+        attempts++;
+        ph = { chunks: 0, thoughtChunks: 0 };
         const attemptCtrl = new AbortController();
         attemptSignal = AbortSignal.any([total, attemptCtrl.signal]);
         const firstTimer = setTimeout(
-          () =>
-            attemptCtrl.abort(
-              timeoutError(`No first chunk within ${Math.round(t.firstChunkTimeoutMs / 1000)} s`),
-            ),
+          () => attemptCtrl.abort(firstChunkTimeout(stallPhase(ph), t.firstChunkTimeoutMs)),
           t.firstChunkTimeoutMs,
         );
         try {
@@ -194,8 +286,11 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
             }),
             attemptSignal,
           );
+          // The SDK resolves once Google's HTTP response headers have arrived.
+          ph.headersMs = Date.now() - started;
           const first = await raceAbort(stream.next(), attemptSignal);
           if (!first.done) {
+            ph.firstChunkMs = Date.now() - started;
             args.onFirstChunk?.();
             consume(first.value);
           }
@@ -242,11 +337,22 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
       throw err;
     }
     record(ctx, runMeta(args.kind, args.model, started, true, tokensOf(lastUsage)));
+    diag(true, { phase: 'done', tokens: tokensOf(lastUsage) });
     if (blocked) throw blockedError(blocked);
     return text;
   } catch (err) {
     // attemptSignal carries our abort reason (TIMEOUT / CANCELLED) if we pressed stop.
-    throw toAppError(err, attemptSignal);
+    const mapped = toAppError(err, attemptSignal);
+    const status = googleStatus(err);
+    if (!(mapped.code === 'INVALID_INPUT' && ph.chunks > 0)) {
+      diag(false, {
+        phase:
+          status !== undefined ? 'http-error' : mapped.code === 'CANCELLED' ? 'cancelled' : stallPhase(ph),
+        ...failureInfo(err instanceof AppError ? err : (err as unknown)),
+        ...(mapped.code === 'TIMEOUT' ? { error: 'TIMEOUT' } : {}),
+      });
+    }
+    throw mapped;
   } finally {
     clearTimeout(totalTimer);
   }

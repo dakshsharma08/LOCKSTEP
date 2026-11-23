@@ -30,8 +30,15 @@ export interface GeminiLike {
 }
 
 /** The ONLY place the API key is used. It goes to the SDK, which sends it as the x-goog-api-key header. */
-export function createGeminiClient(apiKey: string): GeminiLike {
-  return new GoogleGenAI({ apiKey });
+export function createGeminiClient(
+  apiKey: string,
+  opts: { apiVersion?: string; baseUrl?: string } = {},
+): GeminiLike {
+  return new GoogleGenAI({
+    apiKey,
+    ...(opts.apiVersion ? { apiVersion: opts.apiVersion } : {}),
+    ...(opts.baseUrl ? { httpOptions: { baseUrl: opts.baseUrl } } : {}),
+  });
 }
 
 export const FALLBACK_MODEL = 'gemini-flash-latest';

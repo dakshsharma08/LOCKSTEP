@@ -169,3 +169,13 @@ The 3 skipped tests are the live Gemini smoke tests (`tests/live/gemini.live.tes
 
 Migration checks: 174 files / ~10 MB; no secret patterns; `.env.example` has no values; no cricket-project keywords; **0** file blobs in common with the original repository's non-LOCKSTEP files.
 
+## 12. First real-key run: planning timed out (found by the owner after §11)
+
+The owner's first run with a real key failed: planning stopped after ~30 s with *"Gemini took too long. No first chunk within 30 s."* (model `gemini-3.8-flash`). This is exactly the risk flagged in §5, and it confirms that the mocked tests could not catch it.
+
+- **Not the model name:** `gemini-3.8-flash` is a real GA model; a bad name would fail at once with a 404.
+- **Most likely cause:** plan requests never set a thinking level, so the model used its default silent thinking and sent nothing for 30+ s. **This was inferred from the code and the symptom, not reproduced** (no key in the build environment).
+- **Fix:** explicit LOW thinking level for planning, a one-time fallback if Google rejects thinking settings, phase-specific timeout messages, an `ai_diag` log line with timings and Google's redacted error text, and `npm run diagnose:gemini` (see `docs/SETUP.md`, Troubleshooting). The timeout was not raised.
+- **Regression tests:** `tests/integration/gemini-first-chunk.test.ts` (the real SDK against a local fake Gemini over real HTTP/SSE reproduces silent thinking, a never-answering network, thought-summary first chunks, a thinking-field 400 with fallback, and key redaction), `tests/integration/diagnose.test.ts`, `tests/unit/thinking.test.ts`.
+- **Still unverified until you run it:** that the fix removes the timeout against real Google. Run `npm run diagnose:gemini`.
+

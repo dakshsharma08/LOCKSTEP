@@ -13,9 +13,15 @@
  * The same records are returned in API responses so the browser can store them too.
  */
 import type { AiKind, AiRunMeta } from '../../shared/api';
+import { redactSecrets } from './redact';
 
 export interface RunRecorder {
   record(meta: AiRunMeta): void;
+  /**
+   * One extra structured log line about HOW a call went (timings by phase, HTTP status,
+   * Google's error text). Never contains prompts or user text; secrets are redacted.
+   */
+  diag(event: Record<string, unknown>): void;
 }
 
 export interface RunRecorderOptions {
@@ -23,12 +29,17 @@ export interface RunRecorderOptions {
   fetchImpl?: typeof fetch;
   /** Where log lines go (stdout by default). */
   log?: (line: string) => void;
+  /** Secrets (e.g. the Gemini key) that must never appear in a log line. */
+  secrets?: (string | null | undefined)[];
 }
 
 export function createRunRecorder(opts: RunRecorderOptions): RunRecorder {
   const log = opts.log ?? ((line: string) => console.log(line));
   const doFetch = opts.fetchImpl ?? ((...args: Parameters<typeof fetch>) => fetch(...args));
   return {
+    diag(event) {
+      log(redactSecrets(JSON.stringify({ type: 'ai_diag', ...event }), opts.secrets));
+    },
     record(meta) {
       log(JSON.stringify({ type: 'ai_run', ...meta }));
       if (!opts.supabase) return;

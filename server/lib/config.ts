@@ -14,6 +14,10 @@ export interface ServerConfig {
   model: string | null;
   /** Optional "Pro" model used for coach replanning (GEMINI_MODEL_HEAVY). */
   heavyModel: string | null;
+  /** GEMINI_API_VERSION (v1 | v1beta | v1alpha). null = the SDK's own default. */
+  apiVersion: string | null;
+  /** GEMINI_THINKING_LEVEL for plan generation (see gemini/thinking.ts). */
+  planThinking: string | null;
   allowedOrigins: string[];
   upstash: { url: string; token: string } | null;
   supabase: { url: string; serviceKey: string } | null;
@@ -33,6 +37,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): ServerConfig {
     geminiApiKey: clean(env.GEMINI_API_KEY),
     model: clean(env.GEMINI_MODEL),
     heavyModel: clean(env.GEMINI_MODEL_HEAVY),
+    apiVersion: /^v1(alpha|beta)?$/.test(clean(env.GEMINI_API_VERSION) ?? '')
+      ? clean(env.GEMINI_API_VERSION)
+      : null,
+    planThinking: clean(env.GEMINI_THINKING_LEVEL),
     allowedOrigins: (env.ALLOWED_ORIGINS ?? '')
       .split(',')
       .map((s) => s.trim().replace(/\/+$/, ''))

@@ -22,11 +22,13 @@ import { createGeminiClient, ModelResolver, type GeminiLike } from './gemini/cli
 import { MotivationCache } from './gemini/motivation';
 import { createAiRouter } from './gemini/routes';
 import { createRunRecorder } from './lib/aiRuns';
+import { registerSecrets } from './lib/redact';
 import { loadConfig, resolveTuning, type TuningOverrides } from './lib/config';
 import { AppError } from './lib/errors';
 import { createRateLimiter, rateLimitMiddleware, rulesFrom } from './lib/rateLimit';
 
 import { createAccountRouter } from './account';
+import { parsePlanThinking } from './gemini/thinking';
 import { ImageModelResolver } from './gemini/background';
 import { createWallpaperRouter, storeFromEnv, type WallpaperStore } from './wallpaper/living';
 export type { GeminiLike } from './gemini/client';
@@ -47,11 +49,16 @@ export interface CreateAppOptions {
 export function createApp(opts: CreateAppOptions = {}): Express {
   const env = opts.env ?? process.env;
   const config = loadConfig(env);
+  registerSecrets([config.geminiApiKey, config.supabase?.serviceKey, config.upstash?.token]);
   const tuning = resolveTuning(opts.tuning);
   const now = opts.now ?? (() => new Date());
 
   // No key → no client. The AI routes then answer 503 AI_NOT_CONFIGURED; we never fake AI output.
-  const gemini = opts.gemini ?? (config.geminiApiKey ? createGeminiClient(config.geminiApiKey) : null);
+  const gemini =
+    opts.gemini ??
+    (config.geminiApiKey
+      ? createGeminiClient(config.geminiApiKey, { apiVersion: config.apiVersion ?? undefined })
+      : null);
   const models = gemini
     ? new ModelResolver(gemini, {
         pinned: config.model,
@@ -124,11 +131,15 @@ export function createApp(opts: CreateAppOptions = {}): Express {
     createAiRouter({
       gemini,
       models,
-      recorder: createRunRecorder({ supabase: config.supabase }),
+      recorder: createRunRecorder({
+        supabase: config.supabase,
+        secrets: [config.geminiApiKey, config.supabase?.serviceKey],
+      }),
       tuning,
       now,
       limiter,
       motivationCache: new MotivationCache(),
+      planThinking: parsePlanThinking(config.planThinking),
       images: models
         ? new ImageModelResolver(() => models.listedNames(), {
             pinned: env.GEMINI_IMAGE_MODEL?.trim() || null,

@@ -27,7 +27,7 @@ import {
 import { dayKey, localToUtcIso, type DstAdjustment } from '../../shared/time';
 import { AppError } from '../lib/errors';
 import { streamGemini, type CallContext } from './call';
-import { supportsThinking } from './client';
+import { isThinkingRejection, planThinkingConfig, thinkingFallbacks, type PlanThinking } from './thinking';
 import { buildPlanSystemInstruction, buildPlanUserParts } from './prompts';
 import { repairPlan } from './repair';
 import { buildPlanJsonSchema } from './schema';
@@ -105,6 +105,7 @@ export async function generatePlan(
   job: PlanJob,
   model: string,
   emit: (e: PlanStreamEvent) => void,
+  opts: { thinking?: PlanThinking } = {},
 ): Promise<PlanResult> {
   const systemInstruction = buildPlanSystemInstruction({
     intake: job.intake,
@@ -117,36 +118,57 @@ export async function generatePlan(
 
   emit({ event: 'status', data: { phase: 'thinking', message: 'Gemini is thinking about your plan…' } });
 
-  const parser = new PlanStreamParser();
-  const text = await streamGemini(call, {
-    kind: 'plan',
-    model,
-    request: {
-      contents: [{ role: 'user', parts: buildPlanUserParts(job.intake) }],
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-        responseJsonSchema,
-        // Thought summaries arrive as early chunks, which keeps the first-chunk
-        // timer happy on thinking models. We never show or store them.
-        ...(supportsThinking(model) ? { thinkingConfig: { includeThoughts: true } } : {}),
-      },
-    },
-    onFirstChunk: () =>
-      emit({ event: 'status', data: { phase: 'streaming', message: 'Writing your milestones…' } }),
-    onText: (delta) => {
-      for (const ev of parser.push(delta)) {
-        if (ev.type === 'feasibility') {
-          emit({
-            event: 'feasibility',
-            data: { feasibility: ev.feasibility, feasibilityReason: ev.feasibilityReason },
-          });
-        } else {
-          emit({ event: 'milestone', data: { index: ev.index, milestone: ev.milestone } });
-        }
+  // Plan generation asks for a LOW thinking level (see gemini/thinking.ts). If Google rejects the
+  // thinking settings for this model/API version, retry once with plainer settings rather than
+  // failing the whole plan; the rejection and the retry are both logged.
+  const configs = thinkingFallbacks(planThinkingConfig(model, opts.thinking));
+  let text = '';
+  for (let i = 0; i < configs.length; i++) {
+    const thinkingConfig = configs[i];
+    const parser = new PlanStreamParser(); // a fresh parser per attempt
+    try {
+      text = await streamGemini(call, {
+        kind: 'plan',
+        model,
+        request: {
+          contents: [{ role: 'user', parts: buildPlanUserParts(job.intake) }],
+          config: {
+            systemInstruction,
+            responseMimeType: 'application/json',
+            responseJsonSchema,
+            ...(thinkingConfig ? { thinkingConfig } : {}),
+          },
+        },
+        onFirstChunk: () =>
+          emit({ event: 'status', data: { phase: 'streaming', message: 'Writing your milestones…' } }),
+        onText: (delta) => {
+          for (const ev of parser.push(delta)) {
+            if (ev.type === 'feasibility') {
+              emit({
+                event: 'feasibility',
+                data: { feasibility: ev.feasibility, feasibilityReason: ev.feasibilityReason },
+              });
+            } else {
+              emit({ event: 'milestone', data: { index: ev.index, milestone: ev.milestone } });
+            }
+          }
+        },
+      });
+      break;
+    } catch (err) {
+      if (i < configs.length - 1 && isThinkingRejection(err)) {
+        call.recorder.diag({
+          event: 'thinking_fallback',
+          kind: 'plan',
+          model,
+          from: thinkingConfig ?? null,
+          to: configs[i + 1] ?? null,
+        });
+        continue;
       }
-    },
-  });
+      throw err;
+    }
+  }
 
   emit({ event: 'status', data: { phase: 'validating', message: 'Checking dates, order and hours…' } });
   let validation = validateText(text, job.ctx);

@@ -11,6 +11,7 @@
  * request details we don't want to leak, so we map them to our own messages.
  */
 import type { ApiError, ApiErrorCode } from '../../shared/api';
+import { upstreamReason } from './redact';
 
 /** HTTP status used when an error is sent as a normal JSON response. */
 export const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
@@ -127,37 +128,38 @@ export function toAppError(err: unknown, signal?: AbortSignal): AppError {
 
   const status = upstreamStatus(err);
   if (status !== undefined) {
-    // The SDK message may contain request details, so only look for a few keywords.
+    // Google's own explanation (redacted, short). It is the most useful clue when a
+    // request is rejected, e.g. "INVALID_ARGUMENT: Unknown name 'thinkingLevel'…".
+    const reason = upstreamReason(err);
     const raw = err instanceof Error ? err.message : '';
+    const why = (extra?: string) => [
+      extra ?? `Gemini status ${status}`,
+      ...(reason ? [`Google said: ${reason}`] : []),
+    ];
     if (status === 401 || status === 403 || /API[_ ]KEY/i.test(raw)) {
       return new AppError(
         'AI_NOT_CONFIGURED',
         "The server's Gemini API key was rejected. Check GEMINI_API_KEY on the server.",
-        {
-          details: [`Gemini status ${status}`],
-        },
+        { details: why() },
       );
     }
     if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
-      return new AppError('AI_BUSY', undefined, { details: [`Gemini status ${status}`] });
+      return new AppError('AI_BUSY', undefined, { details: why() });
     }
     if (status === 404) {
       return new AppError('INTERNAL', "The configured Gemini model isn't available to this API key.", {
         retryable: false,
-        details: ['Gemini status 404 — check GEMINI_MODEL'],
+        details: why('Gemini status 404 — check GEMINI_MODEL'),
       });
     }
     if (status === 400) {
       return new AppError(
         'INTERNAL',
         "Gemini couldn't process this request. If you attached a file, try a different one.",
-        {
-          retryable: false,
-          details: ['Gemini status 400'],
-        },
+        { retryable: false, details: why() },
       );
     }
-    return new AppError('INTERNAL', undefined, { details: [`Gemini status ${status}`] });
+    return new AppError('INTERNAL', undefined, { details: why() });
   }
 
   // `fetch failed` and friends: we couldn't reach Gemini at all.

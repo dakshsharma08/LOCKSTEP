@@ -34,6 +34,26 @@ npm run build && npm start    # http://localhost:8080
 4. Check it: `curl localhost:8787/api/health` should show `"configured": true`.
 5. Run the live smoke test: `npm run test:live`. Without a key it reports **SKIPPED**, never PASSED.
 
+### Troubleshooting: "Gemini took too long" / planning fails after ~30 s
+
+Run the diagnostic. It makes **real** calls to Google with your key (never printed), from the cheapest test to the full planning flow, and tells you which problem it found:
+
+```bash
+npm run diagnose:gemini                       # uses GEMINI_API_KEY from .env
+npm run diagnose:gemini -- --model gemini-3.8-flash --api-version v1beta
+```
+
+| It says | What it means | Fix |
+|---|---|---|
+| `NETWORK PROBLEM` | This machine gets no HTTP response from Google. Not the model, not the app. | VPN / proxy / firewall / DNS / IPv6. Behind a proxy: set `HTTPS_PROXY` and `NODE_USE_ENV_PROXY=1`. For IPv6 trouble: `NODE_OPTIONS=--dns-result-order=ipv4first`. |
+| `KEY PROBLEM` | Google answered but rejected the key. | Check `GEMINI_API_KEY`; make sure the Gemini API is enabled for that key. |
+| `MODEL NOT AVAILABLE` | The model isn't listed for your key. | Set `GEMINI_MODEL` to a listed model, or leave it empty to auto-pick. |
+| `ROOT CAUSE (thinking latency)` | Google accepted the request but the model thought silently past the 30 s limit. | Fixed by default (planning asks for a LOW thinking level). Tune with `GEMINI_THINKING_LEVEL`. |
+| `API VERSION` | Requests work on `v1beta` but not `v1`. | `GEMINI_API_VERSION=v1beta`. |
+| `REQUEST REJECTED` | Google answered HTTP 400 for the plan request; the exact reason is printed. | That reason names the offending field. |
+
+The server log also helps. Every Gemini call writes an `ai_run` line **and** an `ai_diag` line with where the time went (`headersMs` = Google's HTTP response arrived, `firstChunkMs` = first data, `firstTextMs` = first visible text), the HTTP `status` and Google's own error text (secrets redacted). The in-app error says which wait timed out: *"Google didn't answer the request"* (network) versus *"Gemini accepted the request but sent no output"* (the model is thinking).
+
 ## 3. Deploy to Vercel (frontend + API in one project)
 
 The repo is already set up for Vercel: `vercel.json` rewrites `/api/*` to the Express app in `api/index.js` (which imports the API bundled by `npm run build`) and serves the SPA for every other route.

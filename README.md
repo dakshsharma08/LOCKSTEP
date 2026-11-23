@@ -34,6 +34,7 @@ Everything except the AI features works with no key: guest mode, offline, the ma
 | `npm run build` | typecheck → Vite build → API bundle for Vercel → secret-leak check |
 | `npm start` | one Node server for the built app and the API (Cloud Run / local prod) |
 | `npm test` | unit + integration tests (Gemini mocked with MSW in tests only) |
+| `npm run diagnose:gemini` | real calls to Google with your key: finds why planning is slow or failing (network, key, model, thinking latency, API version) |
 | `npm run test:live` | real Gemini smoke test (reports **SKIPPED** without a key) |
 | `npm run test:e2e` | Playwright acceptance flow at 360/390/430/1440 px + axe accessibility sweep |
 | `npm run submission -- --url <live-url>` | rebuilds every Handshake asset from the real app |

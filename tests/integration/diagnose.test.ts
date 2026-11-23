@@ -1,0 +1,95 @@
+/**
+ * The diagnostic (`npm run diagnose:gemini`) must reach the RIGHT conclusion from measurements.
+ * It runs against the local fake Gemini (tests/helpers/fakeGemini.ts); against Google it is the same code.
+ */
+import { afterEach, describe, expect, it } from 'vitest';
+import { runDiagnostics } from '../../server/gemini/diagnose';
+import { startFakeGemini, type FakeGemini, type FakeReply, type FakeRequest } from '../helpers/fakeGemini';
+
+// Built at runtime: a key-shaped literal in source could trip GitHub secret scanning.
+const KEY = `${['AI', 'za'].join('')}SyFAKE-diagnostic-key-0123456789abcd`;
+let fake: FakeGemini | null = null;
+afterEach(async () => {
+  await fake?.close();
+  fake = null;
+});
+
+const planStream = (r: FakeRequest) => r.stream && !!r.body?.generationConfig?.responseJsonSchema;
+const levelOf = (r: FakeRequest) =>
+  r.body?.generationConfig?.thinkingConfig?.thinkingLevel as string | undefined;
+
+async function diagnose(
+  decide: (r: FakeRequest) => FakeReply | void,
+  extra: Parameters<typeof runDiagnostics>[0] extends infer O ? Partial<O> : never = {},
+) {
+  fake = await startFakeGemini(decide);
+  const lines: string[] = [];
+  const report = await runDiagnostics({
+    apiKey: KEY,
+    baseUrl: fake.baseUrl,
+    model: 'gemini-3.8-flash',
+    reachTimeoutMs: 400,
+    callTimeoutMs: 2000,
+    planTimeoutMs: 3000,
+    firstChunkTimeoutMs: 300, // stands in for the real 30 s limit
+    onLine: (l) => lines.push(l),
+    ...extra,
+  });
+  return { report, lines, text: lines.join('\n') };
+}
+
+describe('diagnose: reaches the right conclusion', () => {
+  it('finds thinking latency as the root cause when only the default-thinking plan request is slow', async () => {
+    const { report, text } = await diagnose((r) =>
+      planStream(r) ? { firstChunkDelayMs: levelOf(r) === 'LOW' ? 10 : 900 } : {},
+    );
+
+    expect(report.reach.every((x) => x.ok && x.modelListed)).toBe(true);
+    expect(report.minimal.every((m) => m.timing.ok)).toBe(true);
+    const [A, B] = [report.plan.find((p) => p.variant === 'A')!, report.plan.find((p) => p.variant === 'B')!];
+    expect(A.timing.firstChunkMs).toBeGreaterThan(300);
+    expect(B.timing.firstChunkMs).toBeLessThan(300);
+    expect(B.timing.jsonOk).toBe(true);
+    expect(report.verdict.join('\n')).toMatch(/ROOT CAUSE \(thinking latency\)/);
+    // …and the complete /api/plan flow of the app works with the fix.
+    expect(report.flow?.ok).toBe(true);
+    expect(report.verdict.join('\n')).toMatch(/FULL FLOW OK/);
+    expect(text).not.toContain(KEY);
+  });
+
+  it('reports a NETWORK PROBLEM, and stops early, when Google never answers', async () => {
+    const t0 = Date.now();
+    const { report, text } = await diagnose(() => ({ neverRespond: true }));
+
+    expect(report.reach.every((x) => !x.ok)).toBe(true);
+    expect(report.verdict.join('\n')).toMatch(/NETWORK PROBLEM.*could not get an HTTP response/);
+    expect(report.verdict.join('\n')).toMatch(/proxy|firewall|VPN/i);
+    expect(report.minimal).toHaveLength(0); // later steps were skipped
+    expect(Date.now() - t0).toBeLessThan(3000);
+    expect(text).toMatch(/Stopping here/);
+  });
+
+  it('suggests GEMINI_API_VERSION=v1beta when requests only work on v1beta', async () => {
+    const { report } = await diagnose(
+      (r) =>
+        r.version === 'v1' && r.model
+          ? { error: { status: 400, message: 'Unknown name "thinkingConfig": Cannot find field.' } }
+          : {},
+      { skipPlan: true },
+    );
+    expect(report.verdict.join('\n')).toMatch(/GEMINI_API_VERSION=v1beta/);
+  });
+
+  it("reports a KEY PROBLEM with Google's reason, and never prints the key", async () => {
+    const { report, text } = await diagnose(() => ({
+      error: { status: 403, code: 'PERMISSION_DENIED', message: `API key not valid. ${KEY}` },
+    }));
+    expect(report.verdict.join('\n')).toMatch(/KEY PROBLEM.*HTTP 403.*PERMISSION_DENIED/);
+    expect(text + JSON.stringify(report)).not.toContain(KEY);
+  });
+
+  it("flags a model that is not in the key's model list", async () => {
+    const { report } = await diagnose(() => ({}), { model: 'gemini-9.9-flash', skipPlan: true });
+    expect(report.verdict.join('\n')).toMatch(/MODEL NOT AVAILABLE/);
+  });
+});

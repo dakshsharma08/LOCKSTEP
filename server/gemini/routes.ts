@@ -30,6 +30,7 @@ import type { GeminiLike, ModelResolver } from './client';
 import { CoachRequestSchema, runCoach } from './coach';
 import { WeeklyInsightRequestSchema, generateWeeklyInsight } from './insight';
 import { MotivationRequestSchema, generateMotivation, type MotivationCache } from './motivation';
+import type { PlanThinking } from './thinking';
 import { BackgroundRequestSchema, generateBackground, type ImageModelResolver } from './background';
 import { generatePlan, preparePlanJob } from './plan';
 
@@ -42,6 +43,8 @@ export interface AiDeps {
   now: () => Date;
   limiter: RateLimiter;
   motivationCache: MotivationCache;
+  /** How much Gemini thinks when planning (GEMINI_THINKING_LEVEL). */
+  planThinking?: PlanThinking;
   /** Image model discovery for AI backgrounds (null when AI isn't configured). */
   images?: ImageModelResolver | null;
   wallpaperStore: HealthResponse['wallpaperStore'];
@@ -108,7 +111,9 @@ export function createAiRouter(deps: AiDeps): Router {
     const call = callContext(deps, gemini, signal);
     try {
       const model = await models.resolve();
-      const result = await generatePlan(call, job, model, (e) => sse.send(e));
+      const result = await generatePlan(call, job, model, (e) => sse.send(e), {
+        thinking: deps.planThinking,
+      });
       sse.send({ event: 'status', data: { phase: 'done', message: 'Your plan is ready.' } });
       sse.send({ event: 'result', data: result });
     } catch (err) {
