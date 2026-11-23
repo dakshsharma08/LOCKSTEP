@@ -7,8 +7,12 @@
  */
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = new URL('..', import.meta.url).pathname;
+// The project root, from this file's location (not process.cwd()). fileURLToPath, never URL.pathname:
+// on Windows .pathname is "/C:/…", which made dist/ (and .env, so the GEMINI_API_KEY value check)
+// impossible to find.
+const root = fileURLToPath(new URL('..', import.meta.url));
 const dist = join(root, 'dist');
 if (!existsSync(dist)) {
   console.error('check-bundle-secrets: dist/ not found. Run vite build first.');
