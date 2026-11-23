@@ -50,8 +50,8 @@ describe('pickFallbacks (from the models THIS key can call)', () => {
   const list = [
     'models/gemini-3.8-flash',
     'models/gemini-3.7-flash', // 503 / timeout in real diagnostics: excluded from the default chain
-    'models/gemini-3.6-flash', // OK in ~5 s
-    'models/gemini-3.5-flash', // OK in ~23 s
+    'models/gemini-3.6-flash', // small requests OK, but the full plan stream stalled: second
+    'models/gemini-3.5-flash', // full plan request OK (~78 s): first
     'models/gemini-3.5-flash-lite',
     'models/gemini-2.5-flash', // 404, "not available to new users": excluded from the default chain
     'models/gemini-3-flash-preview', // preview: never auto-picked
@@ -61,13 +61,18 @@ describe('pickFallbacks (from the models THIS key can call)', () => {
     'models/gemini-embedding-001',
   ];
 
-  it('default order after gemini-3.8-flash: gemini-3.6-flash, then gemini-3.5-flash', () => {
-    expect(pickFallbacks(list, 'gemini-3.8-flash', 2)).toEqual(['gemini-3.6-flash', 'gemini-3.5-flash']);
+  it('default order after gemini-3.8-flash: gemini-3.5-flash, then gemini-3.6-flash', () => {
+    expect(pickFallbacks(list, 'gemini-3.8-flash', 2)).toEqual(['gemini-3.5-flash', 'gemini-3.6-flash']);
+  });
+  it('3.5 comes first even though 3.6 is the newer version (preferred order beats recency)', () => {
+    expect(pickFallbacks(['gemini-3.6-flash', 'gemini-3.5-flash'], 'gemini-3.8-flash', 1)).toEqual([
+      'gemini-3.5-flash',
+    ]);
   });
   it("the order does not depend on the order of the key's list", () => {
     expect(pickFallbacks([...list].reverse(), 'gemini-3.8-flash', 2)).toEqual([
-      'gemini-3.6-flash',
       'gemini-3.5-flash',
+      'gemini-3.6-flash',
     ]);
   });
   it('gemini-3.7-flash and gemini-2.5-flash are never picked automatically, even with room to spare', () => {
@@ -75,7 +80,7 @@ describe('pickFallbacks (from the models THIS key can call)', () => {
     expect(all).not.toContain('gemini-3.7-flash');
     expect(all).not.toContain('gemini-2.5-flash');
     // …and the rest is still ordered: preferred first, then other Flash, Flash-Lite last.
-    expect(all).toEqual(['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite']);
+    expect(all).toEqual(['gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite']);
   });
   it('a preferred model the key does not list is skipped (a retired model drops out by itself)', () => {
     expect(pickFallbacks(['gemini-3.8-flash', 'gemini-3.5-flash'], 'gemini-3.8-flash', 2)).toEqual([
@@ -99,7 +104,7 @@ describe('pickFallbacks (from the models THIS key can call)', () => {
     ).toEqual([]);
   });
   it('respects the maximum, including 1 and 0', () => {
-    expect(pickFallbacks(list, 'gemini-3.8-flash', 1)).toEqual(['gemini-3.6-flash']);
+    expect(pickFallbacks(list, 'gemini-3.8-flash', 1)).toEqual(['gemini-3.5-flash']);
     expect(pickFallbacks(list, 'gemini-3.8-flash', 0)).toEqual([]);
   });
   it('never returns the primary, even if the primary is a preferred model', () => {
@@ -112,10 +117,10 @@ describe('pickFallbacks (from the models THIS key can call)', () => {
     expect(pickFallbacks([], 'gemini-3.8-flash', 2)).toEqual([]);
   });
   it('works when the primary is an alias', () => {
-    expect(pickFallbacks(list, 'gemini-flash-latest', 1)).toEqual(['gemini-3.6-flash']);
+    expect(pickFallbacks(list, 'gemini-flash-latest', 1)).toEqual(['gemini-3.5-flash']);
   });
   it('the constants say exactly what was verified', () => {
-    expect([...PREFERRED_FALLBACKS]).toEqual(['gemini-3.6-flash', 'gemini-3.5-flash']);
+    expect([...PREFERRED_FALLBACKS]).toEqual(['gemini-3.5-flash', 'gemini-3.6-flash']);
     expect([...EXCLUDED_FALLBACKS]).toEqual(['gemini-3.7-flash', 'gemini-2.5-flash']);
   });
 });

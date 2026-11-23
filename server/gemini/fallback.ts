@@ -10,7 +10,7 @@
  *   • Only TEMPORARY failures on the primary trigger a fallback. A 400 (bad request), 401/403 (key) or
  *     404 (model missing) would fail on every model, so we show it instead of hiding it.
  *   • The alternatives come from the models YOUR key can actually call (models.list): a preferred order
- *     (gemini-3.6-flash, then gemini-3.5-flash) is applied only to models the key lists, so a retired model
+ *     (gemini-3.5-flash, then gemini-3.6-flash) is applied only to models the key lists, so a retired model
  *     drops out by itself. GEMINI_MODEL_FALLBACKS overrides it.
  *   • Hard cap on upstream calls per plan: 1 + primaryRetries + fallbacks (default 4 calls in total).
  *     503s also count against rate limits, so hammering a struggling API makes things worse.
@@ -62,14 +62,16 @@ function parseCandidate(raw: string): Candidate | null {
 }
 
 /**
- * The default fallback order, from REAL diagnostics on the developer's key (2026-11-23), while the
- * primary `gemini-3.8-flash` answered 503:
- *   gemini-3.6-flash  OK in ~5 s     gemini-3.5-flash  OK in ~23 s
- *   gemini-3.7-flash  503 / timeout  gemini-2.5-flash  404 (not available to new users)
- * So 3.6 is tried first, then 3.5. A preferred model is only used if the key's own model list contains
+ * The default fallback order, from REAL diagnostics on the developer's key (2026-11-23):
+ *   • with the primary `gemini-3.8-flash` answering 503 / later 429 (free-tier quota):
+ *       gemini-3.7-flash 503 / timeout; gemini-2.5-flash 404 (not available to new users);
+ *   • with the full plan request (prompt + response schema, commit ba2deac):
+ *       gemini-3.5-flash  valid plan JSON in ~78 s;
+ *       gemini-3.6-flash  answers small requests, but the plan stream stalled after 13 chunks.
+ * So 3.5 is tried first, then 3.6. A preferred model is only used if the key's own model list contains
  * it, so a model Google retires later drops out by itself. GEMINI_MODEL_FALLBACKS overrides all of this.
  */
-export const PREFERRED_FALLBACKS: readonly string[] = ['gemini-3.6-flash', 'gemini-3.5-flash'];
+export const PREFERRED_FALLBACKS: readonly string[] = ['gemini-3.5-flash', 'gemini-3.6-flash'];
 
 /** Never part of the AUTOMATIC chain for now (see above). Still usable via GEMINI_MODEL_FALLBACKS. */
 export const EXCLUDED_FALLBACKS: readonly string[] = ['gemini-3.7-flash', 'gemini-2.5-flash'];
@@ -157,6 +159,10 @@ export interface ModelPool {
   /** Alternatives, resolved lazily: only looked up once the primary has failed. Never throws. */
   fallbacks(): Promise<string[]>;
   limits: ModelPlanLimits;
+  /** Time left in the request's time limit (ms). Omitted = no limit. */
+  remainingMs?: () => number;
+  /** Don't START another model with less than this left (default 0). */
+  minAttemptMs?: number;
 }
 
 export interface FallbackInfo {
@@ -200,6 +206,21 @@ function stoppedAt(err: unknown, model: string, before: { model: string; error: 
     retryable: err.retryable,
     status: err.status,
     ...(err.headers ? { headers: err.headers } : {}),
+  });
+}
+
+/** The error to report when there is no time left to try another model. */
+function outOfTime(err: unknown, tried: { model: string; error: unknown }[], leftMs: number): unknown {
+  const base = tried.length > 1 ? totalFailure(tried) : err;
+  if (!(base instanceof AppError)) return base;
+  return new AppError(base.code, base.message, {
+    details: [
+      ...(base.details ?? []),
+      `No further model was tried: only ${Math.max(0, Math.round(leftMs / 1000))} s of the planning time limit was left.`,
+    ],
+    retryable: base.retryable,
+    status: base.status,
+    ...(base.headers ? { headers: base.headers } : {}),
   });
 }
 
@@ -253,6 +274,8 @@ export async function runWithFallback<T>(
         .slice(0, allowedFallbackCount(pool.limits));
       const next = queue.shift();
       if (!next) throw tried.length === 1 ? noAlternative(err) : totalFailure(tried);
+      const left = pool.remainingMs?.() ?? Number.POSITIVE_INFINITY;
+      if (left < (pool.minAttemptMs ?? 0)) throw outOfTime(err, tried, left);
 
       hooks.onFallback?.({ from: model, to: next, error: err });
       model = next;

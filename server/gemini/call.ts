@@ -27,8 +27,10 @@ export interface CallContext {
   gemini: GeminiLike;
   recorder: RunRecorder;
   tuning: AiTuning;
-  /** Aborts when the client disconnects. */
+  /** Aborts when the client disconnects (and, for /api/plan, when the plan time limit is reached). */
   signal: AbortSignal;
+  /** When the plan time limit ends (epoch ms), if this request has one. Used to avoid STARTING work that can't finish. */
+  deadlineMs?: number;
   /** Every attempt is appended here and returned to the client. */
   runs: AiRunMeta[];
 }
@@ -39,6 +41,13 @@ export interface CallArgs {
   request: Omit<GenerateContentParameters, 'model'>;
   /** Override the retry count (e.g. 0 for a heavy model that has a fallback). */
   retries?: number;
+  /** Override the per-attempt timeout (default tuning.callTimeoutMs), e.g. for the plan repair. */
+  timeoutMs?: number;
+}
+
+/** Milliseconds left before ctx.deadlineMs (Infinity when there is no deadline). */
+export function remainingMs(ctx: Pick<CallContext, 'deadlineMs'>, now = Date.now()): number {
+  return ctx.deadlineMs === undefined ? Number.POSITIVE_INFINITY : ctx.deadlineMs - now;
 }
 
 /** Visible text of a response: text parts only, skipping "thought" summaries. */
@@ -97,6 +106,7 @@ function record(ctx: CallContext, meta: AiRunMeta) {
 /** One non-streaming call with timeout, retries and logging. */
 export async function callGemini(ctx: CallContext, args: CallArgs): Promise<GenerateContentResponse> {
   const t = ctx.tuning;
+  const timeoutMs = args.timeoutMs ?? t.callTimeoutMs;
   let response: GenerateContentResponse;
   try {
     response = await withRetry(
@@ -110,9 +120,9 @@ export async function callGemini(ctx: CallContext, args: CallArgs): Promise<Gene
                 model: args.model,
                 config: { ...args.request.config, abortSignal: signal },
               }),
-            t.callTimeoutMs,
+            timeoutMs,
             ctx.signal,
-            `No answer within ${Math.round(t.callTimeoutMs / 1000)} s`,
+            `No answer within ${Math.round(timeoutMs / 1000)} s`,
           );
           record(ctx, runMeta(args.kind, args.model, started, true, tokensOf(response)));
           return response;
@@ -171,6 +181,11 @@ interface Phases {
   firstTextMs?: number;
   chunks: number;
   thoughtChunks: number;
+  /** Chunks with visible text (the JSON). Thinking vs text tells a thinking pause from a stalled answer. */
+  textChunks: number;
+  /** When the last chunk arrived, and the longest silence between two chunks (ms). */
+  lastChunkMs?: number;
+  maxGapMs?: number;
 }
 
 type StallPhase = 'waiting-for-http-response' | 'waiting-for-first-chunk' | 'streaming';
@@ -226,7 +241,7 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
 
   let started = Date.now();
   let attempts = 0;
-  let ph: Phases = { chunks: 0, thoughtChunks: 0 };
+  let ph: Phases = { chunks: 0, thoughtChunks: 0, textChunks: 0 };
   let lastUsage: GenerateContentResponse | undefined;
   let text = '';
   let attemptSignal: AbortSignal = total;
@@ -234,13 +249,17 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
   // `as` widens the type: TypeScript can't see the assignment inside consume().
   let blocked = null as string | null;
   const consume = (chunk: GenerateContentResponse) => {
+    const at = Date.now() - started;
+    if (ph.lastChunkMs !== undefined) ph.maxGapMs = Math.max(ph.maxGapMs ?? 0, at - ph.lastChunkMs);
+    ph.lastChunkMs = at;
     ph.chunks++;
     if (chunk.candidates?.[0]?.content?.parts?.some((p) => p.thought)) ph.thoughtChunks++;
     if (chunk.usageMetadata) lastUsage = chunk;
     blocked = blockReason(chunk) ?? blocked;
     const delta = responseText(chunk);
     if (delta) {
-      ph.firstTextMs ??= Date.now() - started;
+      ph.textChunks++;
+      ph.firstTextMs ??= at;
       text += delta;
       args.onText(delta);
     }
@@ -259,6 +278,9 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
       ...(ph.firstTextMs !== undefined ? { firstTextMs: ph.firstTextMs } : {}),
       chunks: ph.chunks,
       thoughtChunks: ph.thoughtChunks,
+      textChunks: ph.textChunks,
+      ...(ph.lastChunkMs !== undefined ? { lastChunkMs: ph.lastChunkMs } : {}),
+      ...(ph.maxGapMs !== undefined ? { maxGapMs: ph.maxGapMs } : {}),
       totalMs: Date.now() - started,
       thinking: args.request.config?.thinkingConfig ?? null,
       ...extra,
@@ -270,7 +292,7 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
       async () => {
         started = Date.now();
         attempts++;
-        ph = { chunks: 0, thoughtChunks: 0 };
+        ph = { chunks: 0, thoughtChunks: 0, textChunks: 0 };
         const attemptCtrl = new AbortController();
         attemptSignal = AbortSignal.any([total, attemptCtrl.signal]);
         const firstTimer = setTimeout(

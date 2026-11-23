@@ -25,8 +25,9 @@ import {
   type ValidationResult,
 } from '../../shared/plan';
 import { dayKey, localToUtcIso, type DstAdjustment } from '../../shared/time';
+import type { ThinkingConfig } from '@google/genai';
 import { AppError } from '../lib/errors';
-import { streamGemini, type CallContext } from './call';
+import { remainingMs, streamGemini, type CallContext } from './call';
 import { runWithFallback, type ModelPool } from './fallback';
 import { isThinkingRejection, planThinkingConfig, thinkingFallbacks, type PlanThinking } from './thinking';
 import { buildPlanSystemInstruction, buildPlanUserParts } from './prompts';
@@ -124,13 +125,15 @@ export async function generatePlan(
    * if Google rejects the thinking settings for this model/API version, retry once with plainer settings
    * rather than failing the whole plan (the rejection and the retry are both logged).
    */
+  // The thinking setting that worked for the plan, reused by the repair call on the same model.
+  let planThinking: ThinkingConfig | undefined;
   const streamFrom = async (model: string, retries: number): Promise<string> => {
     const configs = thinkingFallbacks(planThinkingConfig(model, opts.thinking));
     for (let i = 0; i < configs.length; i++) {
       const thinkingConfig = configs[i];
       const parser = new PlanStreamParser(); // a fresh parser per attempt
       try {
-        return await streamGemini(call, {
+        const text = await streamGemini(call, {
           kind: 'plan',
           model,
           retries,
@@ -158,6 +161,8 @@ export async function generatePlan(
             }
           },
         });
+        planThinking = thinkingConfig;
+        return text;
       } catch (err) {
         if (i < configs.length - 1 && isThinkingRejection(err)) {
           call.recorder.diag({
@@ -198,6 +203,21 @@ export async function generatePlan(
   let validation = validateText(text, job.ctx);
   let repaired = false;
 
+  if (!validation.ok && remainingMs(call) < call.tuning.minAttemptMs) {
+    // Not enough of the plan time limit left for a repair that rewrites the whole plan: say so honestly
+    // instead of starting a call that would be cut off.
+    throw new AppError(
+      'PLAN_INVALID',
+      "Gemini's plan didn't pass our date and hour checks, and there was no time left to repair it. Please try again — a fresh attempt usually works.",
+      {
+        details: [
+          ...validation.errors.slice(0, 11),
+          'Repair skipped: the planning time limit was nearly used up.',
+        ],
+      },
+    );
+  }
+
   if (!validation.ok) {
     const n = validation.errors.length;
     emit({
@@ -212,6 +232,7 @@ export async function generatePlan(
       previousText: text,
       errors: validation.errors,
       allowedDates: job.allowedDates,
+      thinkingConfig: withoutThoughtSummaries(planThinking),
     });
     repaired = true;
     emit({ event: 'status', data: { phase: 'validating', message: 'Re-checking the repaired plan…' } });
@@ -241,4 +262,14 @@ export async function generatePlan(
     todayKey: job.todayKey,
     runs: call.runs,
   };
+}
+
+/**
+ * The repair answer is not streamed, so thought summaries would only cost tokens; keep the level/budget.
+ * Returns undefined when nothing is left (the model's default is then used, as for the plan).
+ */
+export function withoutThoughtSummaries(cfg: ThinkingConfig | undefined): ThinkingConfig | undefined {
+  if (!cfg) return undefined;
+  const { includeThoughts: _dropped, ...rest } = cfg;
+  return Object.keys(rest).length > 0 ? rest : undefined;
 }

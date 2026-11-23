@@ -67,6 +67,18 @@ export interface AiTuning {
   chunkIdleTimeoutMs: number;
   /** …and for the whole stream. */
   streamTotalTimeoutMs: number;
+  /**
+   * The plan repair call rewrites the WHOLE plan (not streamed), so it needs a plan-sized limit:
+   * gemini-3.5-flash took ~78 s to write a plan in real diagnostics.
+   */
+  repairTimeoutMs: number;
+  /**
+   * Hard limit for one /api/plan request: every model attempt and the repair together. Kept well under
+   * Vercel's maxDuration (300 s in vercel.json) so the platform never kills a request half way.
+   */
+  planBudgetMs: number;
+  /** Don't START another model attempt or the repair with less than this much of planBudgetMs left. */
+  minAttemptMs: number;
   /** Retries after the first attempt for 429/500/503. */
   maxRetries: number;
   retryBaseMs: number;
@@ -85,6 +97,9 @@ export const DEFAULT_TUNING: AiTuning = {
   firstChunkTimeoutMs: 30_000,
   chunkIdleTimeoutMs: 30_000,
   streamTotalTimeoutMs: 120_000,
+  repairTimeoutMs: 120_000,
+  planBudgetMs: 270_000,
+  minAttemptMs: 30_000,
   maxRetries: 2,
   retryBaseMs: 800,
   retryMaxMs: 6_000,

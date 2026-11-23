@@ -26,7 +26,8 @@ import { parseFallbackList, pickFallbacks } from './fallback';
 import { buildPlanSystemInstruction, buildPlanUserParts } from './prompts';
 import { preparePlanJob } from './plan';
 import { buildPlanJsonSchema } from './schema';
-import { planThinkingConfig } from './thinking';
+import { parsePlanThinking, planThinkingConfig } from './thinking';
+import { DEFAULT_TUNING } from '../lib/config';
 
 const DEFAULT_BASE = 'https://generativelanguage.googleapis.com';
 
@@ -46,8 +47,16 @@ export interface DiagOptions {
   planTimeoutMs?: number;
   /** The app's own first-chunk timeout during the full-flow step (ms). Default 30 000. */
   firstChunkTimeoutMs?: number;
+  /** The app's limit between two chunks, for the full-flow step and the stall verdicts (ms). Default 30 000. */
+  chunkIdleTimeoutMs?: number;
   /** Live progress lines (the CLI prints them as they happen). */
   onLine?: (line: string) => void;
+  /**
+   * The settings the app would run with (default: process.env, i.e. .env + the shell). Used for
+   * GEMINI_MODEL_FALLBACKS and GEMINI_THINKING_LEVEL in EVERY step, including the full-flow step, so the
+   * diagnostic tests exactly what the app would do.
+   */
+  env?: NodeJS.ProcessEnv;
   sdkVersion?: string;
 }
 
@@ -59,7 +68,15 @@ export interface StreamTiming {
   firstTextMs?: number;
   totalMs: number;
   chunks?: number;
+  /** Chunks that carried a thought summary (thinking) … */
   thoughtChunks?: number;
+  /** … and chunks that carried visible text (the JSON). A chunk can, rarely, carry both. */
+  textChunks?: number;
+  /** When the last chunk arrived (ms after the request started). */
+  lastChunkMs?: number;
+  /** The longest silence between two chunks (ms), and after which chunk (1-based) it happened. */
+  maxGapMs?: number;
+  maxGapAfterChunk?: number;
   tokens?: number;
   thoughtTokens?: number;
   jsonOk?: boolean;
@@ -225,7 +242,8 @@ async function timeStream(
   const timer = setTimeout(() => ctrl.abort(), capMs);
   const t0 = performance.now();
   let headersMs: number | undefined;
-  let firstChunkMs: number | undefined;
+  // Chunk statistics live outside the try, so a stream that stalls still reports what it DID send.
+  const c: ChunkStats = { chunks: 0, thoughtChunks: 0, textChunks: 0 };
   try {
     const stream = await ai.models.generateContentStream({
       model,
@@ -233,21 +251,18 @@ async function timeStream(
       config: { ...req.config, abortSignal: ctrl.signal },
     });
     headersMs = performance.now() - t0;
-    let firstTextMs: number | undefined;
-    let chunks = 0;
-    let thoughtChunks = 0;
     let text = '';
     let usage: { totalTokenCount?: number; thoughtsTokenCount?: number } | undefined;
     for await (const chunk of stream) {
-      chunks++;
-      firstChunkMs ??= performance.now() - t0;
       const parts = chunk.candidates?.[0]?.content?.parts ?? [];
-      if (parts.some((p) => p.thought)) thoughtChunks++;
       const d = partsText(parts);
-      if (d) {
-        firstTextMs ??= performance.now() - t0;
-        text += d;
-      }
+      countChunk(
+        c,
+        performance.now() - t0,
+        parts.some((p) => p.thought),
+        !!d,
+      );
+      if (d) text += d;
       if (chunk.usageMetadata) usage = chunk.usageMetadata;
     }
     let jsonOk: boolean | undefined;
@@ -262,20 +277,60 @@ async function timeStream(
     return {
       ok: true,
       headersMs,
-      firstChunkMs,
-      firstTextMs,
+      ...chunkFields(c),
       totalMs: performance.now() - t0,
-      chunks,
-      thoughtChunks,
       tokens: usage?.totalTokenCount,
       thoughtTokens: usage?.thoughtsTokenCount,
       jsonOk,
     };
   } catch (e) {
-    return failed(e, ctrl.signal.aborted, headersMs, firstChunkMs, t0);
+    return { ...failed(e, ctrl.signal.aborted, headersMs, c.firstChunkMs, t0), ...chunkFields(c) };
   } finally {
     clearTimeout(timer);
   }
+}
+
+interface ChunkStats {
+  chunks: number;
+  thoughtChunks: number;
+  textChunks: number;
+  firstChunkMs?: number;
+  firstTextMs?: number;
+  lastChunkMs?: number;
+  maxGapMs?: number;
+  maxGapAfterChunk?: number;
+}
+
+/** Record one chunk: when it came, whether it was thinking and/or text, and the gap since the previous one. */
+function countChunk(c: ChunkStats, atMs: number, thought: boolean, hasText: boolean): void {
+  if (c.lastChunkMs !== undefined) {
+    const gap = atMs - c.lastChunkMs;
+    if (c.maxGapMs === undefined || gap > c.maxGapMs) {
+      c.maxGapMs = gap;
+      c.maxGapAfterChunk = c.chunks;
+    }
+  }
+  c.chunks++;
+  c.firstChunkMs ??= atMs;
+  c.lastChunkMs = atMs;
+  if (thought) c.thoughtChunks++;
+  if (hasText) {
+    c.textChunks++;
+    c.firstTextMs ??= atMs;
+  }
+}
+
+function chunkFields(c: ChunkStats): Partial<StreamTiming> {
+  if (c.chunks === 0) return {};
+  return {
+    firstChunkMs: c.firstChunkMs,
+    firstTextMs: c.firstTextMs,
+    chunks: c.chunks,
+    thoughtChunks: c.thoughtChunks,
+    textChunks: c.textChunks,
+    lastChunkMs: c.lastChunkMs,
+    ...(c.maxGapMs !== undefined ? { maxGapMs: c.maxGapMs, maxGapAfterChunk: c.maxGapAfterChunk } : {}),
+  };
 }
 
 function failed(
@@ -313,15 +368,25 @@ function timingLine(t: StreamTiming): string {
         `first chunk ${sec(t.firstChunkMs)}`,
         `first text ${sec(t.firstTextMs)}`,
       );
-    if (t.chunks !== undefined) parts.push(`${t.chunks} chunks (${t.thoughtChunks ?? 0} thought)`);
+    if (t.chunks !== undefined) parts.push(chunkLine(t));
     if (t.thoughtTokens) parts.push(`${t.thoughtTokens} thinking tokens`);
     if (t.jsonOk !== undefined) parts.push(t.jsonOk ? 'valid JSON' : 'INVALID JSON');
     return parts.join(' · ');
   }
   if (t.status !== undefined) return `HTTP ${t.status}${t.reason ? ` — Google said: ${t.reason}` : ''}`;
+  if (t.timedOut && t.stalledIn === 'streaming')
+    return `STALLED after ${t.chunks ?? 0} chunks — ${chunkLine(t)}; silent for ${sec(t.totalMs - (t.lastChunkMs ?? 0))} until the ${sec(t.totalMs)} cap`;
   if (t.timedOut)
     return `NO ANSWER in ${sec(t.totalMs)} — stalled ${t.stalledIn?.replace(/-/g, ' ')}${t.headersMs !== undefined ? ` (HTTP response came after ${sec(t.headersMs)})` : ''}`;
   return `failed after ${sec(t.totalMs)}: ${t.error ?? 'unknown error'}`;
+}
+
+/** "13 chunks (13 thinking, 0 text) · last chunk at 41.0 s · longest gap 9.2 s after chunk 4" */
+function chunkLine(t: StreamTiming): string {
+  const out = [`${t.chunks} chunks (${t.thoughtChunks ?? 0} thinking, ${t.textChunks ?? 0} text)`];
+  if (t.lastChunkMs !== undefined) out.push(`last chunk at ${sec(t.lastChunkMs)}`);
+  if (t.maxGapMs !== undefined) out.push(`longest gap ${sec(t.maxGapMs)} after chunk ${t.maxGapAfterChunk}`);
+  return out.join(' · ');
 }
 
 // ───────────────────────────── the run ─────────────────────────────
@@ -332,7 +397,10 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
   const base = (o.baseUrl ?? DEFAULT_BASE).replace(/\/+$/, '');
   const reachCap = o.reachTimeoutMs ?? 15_000;
   const callCap = o.callTimeoutMs ?? 45_000;
-  const planCap = o.planTimeoutMs ?? 90_000;
+  // Same cap as the app's whole-stream limit, so "too slow for the app" and "too slow here" agree.
+  const planCap = o.planTimeoutMs ?? DEFAULT_TUNING.streamTotalTimeoutMs;
+  const env = o.env ?? process.env;
+  const thinkingSetting = parsePlanThinking(env.GEMINI_THINKING_LEVEL);
   const mk = (apiVersion?: string) =>
     new GoogleGenAI({
       apiKey: o.apiKey,
@@ -349,7 +417,7 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
       proxies: ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'NO_PROXY', 'NODE_USE_ENV_PROXY'].filter(
         (k) => process.env[k] || process.env[k.toLowerCase()],
       ),
-      modelEnv: process.env.GEMINI_MODEL?.trim() || null,
+      modelEnv: env.GEMINI_MODEL?.trim() || null,
     },
     model: '',
     modelSource: 'fallback',
@@ -399,7 +467,7 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
   if (reachable.length === 0) {
     // Nothing else can work (no HTTP answer at all, or the key was rejected): don't make the user wait.
     say('\nStopping here: no later step can work until Google is reachable.');
-    report.verdict = diagnose(report, o.firstChunkTimeoutMs ?? 30_000);
+    report.verdict = diagnose(report, o.firstChunkTimeoutMs, o.chunkIdleTimeoutMs);
     say('\nDiagnosis');
     for (const line of report.verdict) say(`  ${line}`);
     return report;
@@ -425,7 +493,7 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
     .filter((n) => /^gemini-.*flash/.test(n))
     .sort();
   say(`  Flash-family models this key can call: ${report.modelsListed.join(', ') || '(none listed)'}`);
-  const fb = parseFallbackList(process.env.GEMINI_MODEL_FALLBACKS);
+  const fb = parseFallbackList(env.GEMINI_MODEL_FALLBACKS);
   report.chainSource =
     fb.models === null ? 'auto' : fb.models.length === 0 ? 'disabled' : 'GEMINI_MODEL_FALLBACKS';
   const chain =
@@ -471,15 +539,23 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
       allowedDates: job.allowedDates,
     });
     const schema = buildPlanJsonSchema();
-    const auto = planThinkingConfig(report.model, 'auto');
+    const appThinking = planThinkingConfig(report.model, thinkingSetting);
+    say(
+      `  Thinking setting used by the app: ${thinkingSetting}${env.GEMINI_THINKING_LEVEL?.trim() ? ' (GEMINI_THINKING_LEVEL)' : ' (default: low)'}`,
+    );
     type Variant = { variant: 'A' | 'B' | 'C'; label: string; thinking: ThinkingConfig | null };
+    // The app's own setting first: if the model is busy, only the first variant is sent.
     const variants: Variant[] = [
       {
+        variant: 'B' as const,
+        label: `this app's setting (${thinkingSetting})`,
+        thinking: appThinking ?? null,
+      },
+      {
         variant: 'A' as const,
-        label: 'before the fix: includeThoughts only (model decides how long to think)',
+        label: 'model default: includeThoughts only (model decides how long to think)',
         thinking: planThinkingConfig(report.model, 'default') ?? null,
       },
-      { variant: 'B' as const, label: 'the fix: low thinking level', thinking: auto ?? null },
       { variant: 'C' as const, label: 'no thinkingConfig at all', thinking: null },
     ].filter(
       (v, i, all) => all.findIndex((w) => JSON.stringify(w.thinking) === JSON.stringify(v.thinking)) === i,
@@ -510,7 +586,7 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
       const timing = await timeStream(
         ai,
         model,
-        planRequest(planThinkingConfig(model, 'auto')),
+        planRequest(planThinkingConfig(model, thinkingSetting)),
         planCap,
         true,
       );
@@ -529,10 +605,20 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
     for (const d of report.flow.error?.details ?? []) say(`    · ${d}`);
   }
 
-  report.verdict = diagnose(report, o.firstChunkTimeoutMs ?? 30_000);
+  report.verdict = diagnose(report, o.firstChunkTimeoutMs, o.chunkIdleTimeoutMs);
   say('\n[6/6] Diagnosis');
   for (const line of report.verdict) say(`  ${line}`);
   return report;
+}
+
+/** Only the named variables that are actually set. */
+function pick(env: NodeJS.ProcessEnv, keys: readonly string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const k of keys) {
+    const v = env[k];
+    if (v !== undefined && v.trim() !== '') out[k] = v;
+  }
+  return out;
 }
 
 async function runFlow(
@@ -556,12 +642,15 @@ async function runFlow(
       GEMINI_MODEL: model,
       ALLOWED_ORIGINS: '',
       ...(o.apiVersion ? { GEMINI_API_VERSION: o.apiVersion } : {}),
+      // The same alternatives and thinking level the app would use (they were ignored here before).
+      ...pick(o.env ?? process.env, ['GEMINI_MODEL_FALLBACKS', 'GEMINI_THINKING_LEVEL']),
     },
     ...(o.baseUrl
       ? { gemini: new GoogleGenAI({ apiKey: o.apiKey, httpOptions: { baseUrl: o.baseUrl } }) as never }
       : {}),
     tuning: {
       ...(o.firstChunkTimeoutMs ? { firstChunkTimeoutMs: o.firstChunkTimeoutMs } : {}),
+      ...(o.chunkIdleTimeoutMs ? { chunkIdleTimeoutMs: o.chunkIdleTimeoutMs } : {}),
       rateLimit: { windowMax: 1000, dayMax: 10000, windowSec: 600 },
     },
   });
@@ -654,7 +743,11 @@ async function runFlow(
 // ───────────────────────────── verdict (pure; unit-tested) ─────────────────────────────
 
 /** Turn the measurements into plain-language conclusions. */
-export function diagnose(r: DiagReport, firstChunkLimitMs = 30_000): string[] {
+export function diagnose(
+  r: DiagReport,
+  firstChunkLimitMs = DEFAULT_TUNING.firstChunkTimeoutMs,
+  idleLimit = DEFAULT_TUNING.chunkIdleTimeoutMs,
+): string[] {
   const out: string[] = [];
   const okReach = r.reach.filter((x) => x.ok);
   const stalledNet = (t: StreamTiming) => !t.ok && t.stalledIn === 'waiting-for-http-response' && t.timedOut;
@@ -742,6 +835,25 @@ export function diagnose(r: DiagReport, firstChunkLimitMs = 30_000): string[] {
       out.push(
         'PLAN REQUEST SLOW: tiny requests are fast, but the plan request is slow with every thinking setting. The cause is the request itself (large schema / long prompt / quota). Try GEMINI_MODEL=<another flash model>.',
       );
+  }
+
+  // A plan stream that started and then went silent, or paused longer than the app allows between chunks.
+  for (const { model, t } of [
+    ...r.plan.map((p) => ({ model: r.model, t: p.timing })),
+    ...r.planAlternatives.map((p) => ({ model: p.model, t: p.timing })),
+  ]) {
+    if (!t.ok && t.timedOut && t.stalledIn === 'streaming') {
+      const silent = t.totalMs - (t.lastChunkMs ?? 0);
+      out.push(
+        (t.textChunks ?? 0) === 0
+          ? `THINKING STALL on ${model}: ${t.chunks} chunks, all thinking and no plan text yet, then silent for ${sec(silent)} until the ${sec(t.totalMs)} cap. The model was still thinking. Try GEMINI_THINKING_LEVEL=minimal, or put another model first.`
+          : `STREAM STALL on ${model}: ${t.chunks} chunks (${t.thoughtChunks ?? 0} thinking, ${t.textChunks} text), then nothing for ${sec(silent)} until the ${sec(t.totalMs)} cap. Google accepted the request and started writing, then stopped sending; the app gives up on a stream after ${sec(idleLimit)} without a chunk.`,
+      );
+    } else if (t.ok && (t.maxGapMs ?? 0) > idleLimit) {
+      out.push(
+        `LONG PAUSE on ${model}: it finished, but paused ${sec(t.maxGapMs)} between two chunks (after chunk ${t.maxGapAfterChunk}). The app gives up after ${sec(idleLimit)} without a chunk, so in the app this request would have failed.`,
+      );
+    }
   }
 
   // The response schema itself rejected ("too many states"): a problem in this app's request, on any model.

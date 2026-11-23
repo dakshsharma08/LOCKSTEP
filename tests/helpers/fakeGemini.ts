@@ -40,6 +40,11 @@ export interface FakeReply {
   thoughtAfterMs?: number;
   /** Override the answer text. Default: a valid plan for plan requests, else "OK". */
   text?: string;
+  /** Send only this many text chunks, then go silent with the connection left open (a mid-stream stall). */
+  stallAfterChunks?: number;
+  /** Pause this long after text chunk number `pauseAfterChunk` (1-based), then continue. */
+  pauseAfterChunk?: number;
+  pauseMs?: number;
 }
 
 export interface FakeGemini {
@@ -239,7 +244,13 @@ export async function startFakeGemini(
     if (res.destroyed) return;
     const size = Math.ceil(text.length / 4);
     const pieces = text.match(new RegExp(`[\\s\\S]{1,${size}}`, 'g')) ?? [text];
-    pieces.forEach((p, i) => send([{ text: p }], i === pieces.length - 1));
+    const upTo = Math.min(pieces.length, reply.stallAfterChunks ?? pieces.length);
+    for (let i = 0; i < upTo; i++) {
+      if (res.destroyed) return;
+      send([{ text: pieces[i] }], i === pieces.length - 1);
+      if (reply.pauseMs && reply.pauseAfterChunk === i + 1) await wait(reply.pauseMs);
+    }
+    if (upTo < pieces.length) return; // stalled: nothing more is sent, the connection stays open
     res.end();
   };
 

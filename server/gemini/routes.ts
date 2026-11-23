@@ -80,6 +80,28 @@ function callContext(deps: AiDeps, gemini: GeminiLike, signal: AbortSignal): Cal
   return { gemini, recorder: deps.recorder, tuning: deps.tuning, signal, runs: [] };
 }
 
+/**
+ * The hard time limit for one /api/plan request (tuning.planBudgetMs, 270 s): every model attempt and the
+ * repair together. It aborts whatever is running with an honest TIMEOUT, well before Vercel's 300 s
+ * maxDuration would kill the function half way (the browser would only see a dropped connection).
+ */
+function planTimeLimit(ms: number): { signal: AbortSignal; deadlineMs: number; clear: () => void } {
+  const ctrl = new AbortController();
+  const s = Math.round(ms / 1000);
+  const timer = setTimeout(
+    () =>
+      ctrl.abort(
+        new AppError(
+          'TIMEOUT',
+          `Planning took longer than ${s} s, so we stopped. Your saved plan still works. Try again in a minute, or build the plan yourself.`,
+          { details: [`phase: plan-time-limit (all model attempts and the repair share ${s} s)`] },
+        ),
+      ),
+    ms,
+  );
+  return { signal: ctrl.signal, deadlineMs: Date.now() + ms, clear: () => clearTimeout(timer) };
+}
+
 export function createAiRouter(deps: AiDeps): Router {
   const router = Router();
   const limit = rateLimitMiddleware(deps.limiter);
@@ -107,9 +129,10 @@ export function createAiRouter(deps: AiDeps): Router {
     const job = preparePlanJob(intake, deps.now());
     const { gemini, models } = requireAi(deps);
 
-    const signal = abortOnDisconnect(res);
+    const timeLimit = planTimeLimit(deps.tuning.planBudgetMs);
+    const signal = AbortSignal.any([abortOnDisconnect(res), timeLimit.signal]);
     const sse = openSse<PlanStreamEvent>(res, { keepAliveMs: deps.tuning.keepAliveMs });
-    const call = callContext(deps, gemini, signal);
+    const call: CallContext = { ...callContext(deps, gemini, signal), deadlineMs: timeLimit.deadlineMs };
     try {
       const model = await models.resolve();
       models.warmFallbacks();
@@ -118,6 +141,9 @@ export function createAiRouter(deps: AiDeps): Router {
         primary: model,
         fallbacks: () => models.fallbacksFor(model),
         limits: deps.tuning.modelFallback,
+        // Never START another model with too little of the plan time limit left.
+        remainingMs: () => timeLimit.deadlineMs - Date.now(),
+        minAttemptMs: deps.tuning.minAttemptMs,
       };
       const result = await generatePlan(call, job, pool, (e) => sse.send(e), {
         thinking: deps.planThinking,
@@ -129,6 +155,7 @@ export function createAiRouter(deps: AiDeps): Router {
       // If the client cancelled there is nobody left to tell.
       if (e.code !== 'CANCELLED') sse.send({ event: 'error', data: e.toJSON() });
     } finally {
+      timeLimit.clear();
       sse.close();
     }
   });

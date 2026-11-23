@@ -98,11 +98,23 @@ export function upstreamStatus(err: unknown): number | undefined {
   return undefined;
 }
 
-/** Statuses worth retrying with backoff (spec: 429, 500 and 503). */
+/**
+ * A 429 that says the QUOTA is used up ("You exceeded your current quota…", "Quota exceeded for metric…").
+ * Free-tier limits are counted per minute or per day, so a retry a second or two later cannot succeed; it
+ * only costs time and another request. (It is still a temporary error: the plan moves on to another model.)
+ */
+export function isQuotaExhausted(err: unknown): boolean {
+  if (upstreamStatus(err) !== 429) return false;
+  const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+  return /quota/i.test(raw);
+}
+
+/** Statuses worth retrying ON THE SAME MODEL with backoff: 429 (unless the quota is used up), 500 and 503. */
 export function isRetryableUpstream(err: unknown): boolean {
   if (err instanceof AppError) return false;
   const s = upstreamStatus(err);
-  return s === 429 || s === 500 || s === 503;
+  if (s === 429) return !isQuotaExhausted(err);
+  return s === 500 || s === 503;
 }
 
 function isAbortError(err: unknown): boolean {
