@@ -106,6 +106,25 @@
   --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
+/*
+ * The mobile app chrome (components/layout/AppShell.tsx), so a full-height screen (the Studio) can fit
+ * exactly BETWEEN the bars instead of guessing:
+ *   top    = the top bar: h-14 + 1px border + the notch inset;
+ *   bottom = the bottom bar: h-16 + 1px border + the home-indicator inset, plus clearance for the round
+ *            New-goal button, which rises above the bar.
+ * Both bars are hidden from md up (the sidebar takes over); a 1rem gap stays at the bottom edge.
+ */
+:root {
+  --shell-top: calc(3.5rem + 1px + env(safe-area-inset-top));
+  --shell-bottom: calc(4rem + 1px + 0.75rem + env(safe-area-inset-bottom));
+}
+@media (min-width: 48rem) {
+  :root {
+    --shell-top: 0px;
+    --shell-bottom: calc(1rem + env(safe-area-inset-bottom));
+  }
+}
+
 @layer base {
   html {
     -webkit-text-size-adjust: 100%;

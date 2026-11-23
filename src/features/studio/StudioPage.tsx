@@ -1,12 +1,14 @@
 /**
  * Lock Screen Studio — the signature feature.
  * Desktop: template rail left · large preview centre · properties right · sticky gold Export.
- * Mobile: phone preview on top · draggable bottom sheet with tabs.
+ * Mobile / tablet: one column that fits exactly between the app's top and bottom bars (no page scroll):
+ *   title + Export → phone preview (takes the remaining height, scaled to fit) → compact editor (tabs).
+ *   The editor expands (tap or swipe its handle, or pick a tab) and the preview shrinks to make room, so
+ *   nothing ever overlaps. Only the editor's content scrolls.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router';
 import * as Tabs from '@radix-ui/react-tabs';
-import { BottomSheet } from '@/components/ui/bottom-sheet';
 import { Download, Smartphone } from 'lucide-react';
 import { useActiveGoalId, useGoalData, useGoals } from '@/db/hooks';
 import { useMinuteMetrics, useMotivation } from '@/features/goals/components';
@@ -122,6 +124,7 @@ export default function StudioPage() {
   const [exportOpen, setExportOpen] = useState(false);
   const [tab, setTab] = useState<Tab>('template');
   const [sheetOpen, setSheetOpen] = useState(false);
+  const swipe = useRef<{ y: number; swiped: boolean } | null>(null);
   const desktop = useMedia('(min-width: 1024px)');
   const previewBox = useRef<HTMLDivElement>(null);
   const [previewW, setPreviewW] = useState(300);
@@ -141,9 +144,18 @@ export default function StudioPage() {
       const r = el.getBoundingClientRect();
       const dev = getDevice(design.device, design.custom);
       const aspect = dev.height / dev.width;
-      const byH = (r.height - 24) / aspect;
-      const w = Math.max(180, Math.min(desktop ? 400 : 340, r.width - 24, byH));
-      setPreviewW(Math.floor(w));
+      if (desktop) {
+        const byH = (r.height - 24) / aspect;
+        setPreviewW(Math.floor(Math.max(180, Math.min(400, r.width - 24, byH))));
+        return;
+      }
+      // Fit the whole phone FRAME (the screen plus PhonePreview's 8px bezel on every side) into the box,
+      // with a little air. No minimum: on a short screen the phone gets smaller; it never spills over the
+      // title or the editor.
+      const FRAME = 16;
+      const AIR = 12;
+      const w = Math.min(340, r.width - FRAME - AIR, (r.height - FRAME - AIR) / aspect);
+      setPreviewW(Math.max(40, Math.floor(w)));
     });
     ro.observe(el);
     return () => ro.disconnect();
@@ -242,7 +254,7 @@ export default function StudioPage() {
   };
 
   const header = (
-    <div className="flex items-center justify-between gap-3 px-4 pt-4 sm:px-6 lg:pt-6">
+    <div className="flex shrink-0 items-center justify-between gap-3 px-4 pb-2 pt-3 sm:px-6 lg:pb-0 lg:pt-6">
       <div className="min-w-0">
         <p className="eyebrow">Lock Screen Studio</p>
         {eligible.length > 1 ? (
@@ -265,7 +277,7 @@ export default function StudioPage() {
       <Button
         onClick={() => setExportOpen(true)}
         icon={<Download className="size-4" strokeWidth={1.75} />}
-        className="sticky top-4 shrink-0 shadow-[0_8px_24px_-10px_rgba(197,161,90,0.6)]"
+        className="shrink-0 shadow-[0_8px_24px_-10px_rgba(197,161,90,0.6)] lg:sticky lg:top-4"
       >
         Export
       </Button>
@@ -277,7 +289,8 @@ export default function StudioPage() {
       ref={previewBox}
       className={cn(
         'flex items-center justify-center',
-        desktop ? 'h-[calc(100dvh-120px)]' : 'h-[calc(100dvh-8.5rem-31dvh)] min-h-[300px] pt-1',
+        // Mobile: whatever height is left between the title and the editor (measured, see above).
+        desktop ? 'h-[calc(100dvh-120px)]' : 'min-h-0 flex-1',
       )}
     >
       <PhonePreview
@@ -355,23 +368,62 @@ export default function StudioPage() {
   }
 
   return (
-    <div>
+    // Exactly the space between the bars. The bottom bar's space is kept as PADDING (box-content: the height
+    // is the content box), so on a very short screen, where the 28rem minimum wins, the page scrolls instead
+    // of hiding the editor behind the bar. (Padding, not a margin: a margin would collapse through the shell.)
+    <div className="box-content flex h-[calc(100dvh-var(--shell-top)-var(--shell-bottom))] min-h-[28rem] flex-col pb-[var(--shell-bottom)]">
       {header}
       {preview}
-      {/* Spacer so the page can scroll past the sheet's resting height. */}
-      <div className="h-[30dvh]" aria-hidden />
-      <BottomSheet label="Studio controls" peek={0.31} expanded={sheetOpen} onExpandedChange={setSheetOpen}>
+      <section
+        aria-label="Studio controls"
+        className={cn(
+          'card mx-2 flex shrink-0 flex-col overflow-hidden p-0 sm:mx-4',
+          // Compact: tabs + one row of templates. Expanded: more room to edit; the preview shrinks to fit.
+          sheetOpen ? 'h-[58%]' : 'h-[clamp(12.5rem,36%,17rem)]',
+        )}
+      >
+        <button
+          type="button"
+          aria-label={sheetOpen ? 'Collapse controls' : 'Expand controls'}
+          aria-expanded={sheetOpen}
+          onPointerDown={(e) => {
+            e.currentTarget.setPointerCapture?.(e.pointerId);
+            swipe.current = { y: e.clientY, swiped: false };
+          }}
+          onPointerUp={(e) => {
+            const s = swipe.current;
+            if (!s) return;
+            const dy = e.clientY - s.y;
+            // A swipe up expands, a swipe down collapses; a tap (or Enter / Space) toggles via onClick.
+            if (Math.abs(dy) >= 12) {
+              s.swiped = true;
+              setSheetOpen(dy < 0);
+            }
+          }}
+          onClick={() => {
+            if (swipe.current?.swiped) {
+              swipe.current = null;
+              return;
+            }
+            swipe.current = null;
+            setSheetOpen((o) => !o);
+          }}
+          className="flex h-6 w-full shrink-0 touch-none cursor-grab items-center justify-center active:cursor-grabbing"
+        >
+          <span className="h-1.5 w-12 rounded-full bg-line-strong" aria-hidden />
+        </button>
         <Tabs.Root
           value={tab}
           onValueChange={(v) => {
             setTab(v as Tab);
-            setSheetOpen(true);
+            // The template strip fits the compact editor; the other sections need more room.
+            if (v !== 'template') setSheetOpen(true);
           }}
           className="flex min-h-0 flex-1 flex-col"
         >
           <Tabs.List
             aria-label="Studio sections"
-            className="flex shrink-0 gap-1 overflow-x-auto px-3 pb-2 pt-1 scrollbar-none"
+            className="flex shrink-0 gap-1 overflow-x-auto px-2 pb-2 pt-1 scrollbar-none"
           >
             {MOBILE_TABS.map((t) => (
               <Tabs.Trigger
@@ -384,16 +436,12 @@ export default function StudioPage() {
             ))}
           </Tabs.List>
           {MOBILE_TABS.map((t) => (
-            <Tabs.Content
-              key={t.id}
-              value={t.id}
-              className="min-h-0 flex-1 overflow-y-auto px-4 pb-[calc(5.5rem+env(safe-area-inset-bottom))] pt-2"
-            >
+            <Tabs.Content key={t.id} value={t.id} className="min-h-0 flex-1 overflow-y-auto px-2 pb-3 pt-1">
               {panel(t.id)}
             </Tabs.Content>
           ))}
         </Tabs.Root>
-      </BottomSheet>
+      </section>
       <ExportDialog
         open={exportOpen}
         onOpenChange={setExportOpen}

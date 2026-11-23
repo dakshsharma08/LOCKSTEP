@@ -42,7 +42,10 @@ export function TemplatePanel({
 }) {
   return (
     <div
-      className={cn('grid gap-3', compact ? 'grid-cols-4 sm:grid-cols-4' : 'grid-cols-2')}
+      // Compact (mobile editor): one row that scrolls sideways; each thumbnail takes the row's height.
+      className={cn(
+        compact ? 'flex h-full max-h-60 snap-x gap-2 overflow-x-auto pb-1' : 'grid grid-cols-2 gap-3',
+      )}
       role="radiogroup"
       aria-label="Template"
     >
@@ -55,6 +58,7 @@ export function TemplatePanel({
           selected={design.template === t.id}
           data={data}
           device={design.device}
+          compact={compact}
           onSelect={() =>
             update((d) => {
               const base = defaultDesign(t.id, undefined, d.device);
@@ -82,6 +86,7 @@ function TemplateThumb({
   selected,
   data,
   device,
+  compact,
   onSelect,
 }: {
   id: TemplateId;
@@ -90,6 +95,7 @@ function TemplateThumb({
   selected: boolean;
   data: WallpaperData;
   device: DeviceId;
+  compact?: boolean;
   onSelect: () => void;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
@@ -120,12 +126,17 @@ function TemplateThumb({
       title={description}
       className={cn(
         'group relative overflow-hidden rounded-[14px] border text-left transition-colors',
+        compact && 'h-full shrink-0 snap-start',
         selected ? 'border-accent ring-1 ring-accent' : 'border-hairline hover:border-line-strong',
       )}
     >
-      <canvas ref={ref} className="block aspect-[1206/2622] w-full bg-surface-2" aria-hidden />
+      <canvas
+        ref={ref}
+        className={cn('block aspect-[1206/2622] bg-surface-2', compact ? 'h-full w-auto' : 'w-full')}
+        aria-hidden
+      />
       <span className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-1 bg-gradient-to-t from-black/85 to-transparent px-2 pb-1.5 pt-6 text-[11px] font-medium text-white">
-        {label}
+        <span className="min-w-0 truncate">{label}</span>
         {selected && <Check className="size-3.5 text-gold-light" strokeWidth={2.5} aria-hidden />}
       </span>
     </button>

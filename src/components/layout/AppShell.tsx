@@ -49,6 +49,10 @@ export function AppShell() {
     return () => window.removeEventListener('keydown', onKey);
   }, [setPaletteOpen]);
 
+  // The Studio is a full-height workspace below the desktop layout: it sizes itself to the space between
+  // the bars (--shell-top / --shell-bottom in index.css), so the page adds no bottom padding there.
+  const workspace = /^\/studio(\/|$)/.test(location.pathname);
+
   // Move focus to the main region on route change (keyboard + screen-reader friendly).
   useEffect(() => {
     document.getElementById('main')?.focus({ preventScroll: true });
@@ -178,7 +182,7 @@ export function AppShell() {
         className={cn(
           'outline-none transition-[padding] duration-300 ease-out',
           sidebarCollapsed ? 'md:pl-[76px]' : 'md:pl-64',
-          'pb-28 md:pb-10',
+          workspace ? 'lg:pb-10' : 'pb-28 md:pb-10',
         )}
       >
         <RouteErrorBoundary key={location.pathname}>
