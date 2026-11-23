@@ -5,6 +5,7 @@ import {
   DEFAULT_MODEL_PLAN_LIMITS,
   allowedFallbackCount,
   isModelUnavailable,
+  isStreamStall,
   isTemporaryUnavailable,
   maxUpstreamCalls,
   parseFallbackList,
@@ -346,5 +347,83 @@ describe('runWithFallback', () => {
     await expect(runWithFallback(p, run)).rejects.toMatchObject({ code: 'CANCELLED' });
     expect(run).toHaveBeenCalledTimes(1);
     expect(p.fallbacks).not.toHaveBeenCalled();
+  });
+});
+
+describe('stall after partial output (Stage 2)', () => {
+  const stall = (phase = 'streaming (no new chunk after 13 chunks: 13 thinking, 0 text)') =>
+    new AppError('TIMEOUT', undefined, { details: ['Stream paused for more than 30 s', `phase: ${phase}`] });
+  const limitHit = () =>
+    new AppError('TIMEOUT', 'Planning took longer than 270 s', { details: ['phase: plan-time-limit (…)'] });
+  const pool = (): ModelPool => ({
+    primary: 'gemini-3.8-flash',
+    fallbacks: vi.fn(async () => ['gemini-3.5-flash', 'gemini-3.6-flash']),
+    limits: DEFAULT_MODEL_PLAN_LIMITS,
+  });
+
+  it('isStreamStall: a timeout AFTER the model started answering (gap or its own stream cap)', () => {
+    expect(isStreamStall(stall())).toBe(true);
+    expect(isStreamStall(stall('streaming (stream time limit)'))).toBe(true);
+  });
+  it('isStreamStall: not the shared plan time limit, not a wait for the first chunk, not other errors', () => {
+    expect(isStreamStall(limitHit())).toBe(false);
+    expect(isStreamStall(stall('waiting-for-first-chunk (HTTP response received, no data yet)'))).toBe(false);
+    expect(isStreamStall(busy503())).toBe(false);
+    expect(isStreamStall(bad400())).toBe(false);
+    expect(
+      isStreamStall(new AppError('TIMEOUT', 'x', { details: ['Stream paused for more than 30 s'] })),
+    ).toBe(false); // no phase = not provably a stall
+  });
+  it('a stall on the primary moves on to the next model (no same-model retry)', async () => {
+    const run = vi.fn(async (m: string) => (m === 'gemini-3.8-flash' ? Promise.reject(stall()) : 'plan'));
+    const seen: string[] = [];
+    const r = await runWithFallback(pool(), run, { onFallback: (i) => seen.push(`${i.from}->${i.to}`) });
+    expect(r.model).toBe('gemini-3.5-flash');
+    expect(run.mock.calls).toEqual([
+      ['gemini-3.8-flash', 1],
+      ['gemini-3.5-flash', 0],
+    ]);
+    expect(seen).toEqual(['gemini-3.8-flash->gemini-3.5-flash']);
+  });
+  it('a stall on an alternative moves on too, within the cap', async () => {
+    const run = vi.fn(async (m: string) => {
+      if (m === 'gemini-3.8-flash') throw busy503();
+      if (m === 'gemini-3.5-flash') throw stall();
+      return 'plan';
+    });
+    const r = await runWithFallback(pool(), run);
+    expect(r.model).toBe('gemini-3.6-flash');
+    expect(run).toHaveBeenCalledTimes(3);
+  });
+  it('stalls everywhere: honest AI_BUSY listing every model, and no more models than the cap allows', async () => {
+    const run = vi.fn(async () => Promise.reject(stall()));
+    const e = (await runWithFallback(pool(), run).catch((x) => x)) as AppError;
+    expect(run).toHaveBeenCalledTimes(3);
+    expect(e.code).toBe('AI_BUSY');
+    expect(e.details?.map((d) => d.split(':')[0])).toEqual([
+      'gemini-3.8-flash',
+      'gemini-3.5-flash',
+      'gemini-3.6-flash',
+    ]);
+  });
+  it('400 and 403 still never trigger a fallback, on the primary or after a stall', async () => {
+    const forbidden = new AppError('AI_NOT_CONFIGURED', 'key rejected', {
+      details: ['Gemini status 403', 'Google said: PERMISSION_DENIED'],
+    });
+    for (const err of [bad400(), forbidden]) {
+      const onPrimary = vi.fn(async () => Promise.reject(err));
+      await expect(runWithFallback(pool(), onPrimary)).rejects.toBe(err);
+      expect(onPrimary).toHaveBeenCalledTimes(1);
+
+      const afterStall = vi.fn(async (m: string) => Promise.reject(m === 'gemini-3.8-flash' ? stall() : err));
+      const e = (await runWithFallback(pool(), afterStall).catch((x) => x)) as AppError;
+      expect(afterStall).toHaveBeenCalledTimes(2);
+      expect(e.code).toBe(err.code);
+    }
+  });
+  it('the plan time limit stops everything: no next model', async () => {
+    const run = vi.fn(async () => Promise.reject(limitHit()));
+    await expect(runWithFallback(pool(), run)).rejects.toMatchObject({ code: 'TIMEOUT' });
+    expect(run).toHaveBeenCalledTimes(1);
   });
 });

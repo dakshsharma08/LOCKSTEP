@@ -260,3 +260,42 @@ test('countdown accuracy: the screen-reader countdown matches an independent cal
     `shown ${shown} min vs expected ${expected} min (${text})`,
   ).toBeLessThanOrEqual(2);
 });
+
+test('a model that stalls mid-plan: its preview is cleared on reset, and the next model writes the plan', async ({
+  page,
+}) => {
+  await page.goto('/new');
+  await page.getByRole('button', { name: 'Try a sample goal' }).click();
+  // The marker makes the fake primary model stream part of a STALE plan, then go silent (e2e/mock-api.ts).
+  await page
+    .getByRole('textbox', { name: 'Your goal' })
+    .fill('Pass the AWS Cloud Practitioner exam (e2e-stall)');
+  for (let i = 0; i < 3; i++) await page.getByRole('button', { name: 'Continue' }).click();
+  await page.getByRole('button', { name: 'Plan with Gemini' }).click();
+
+  // 1. The first model's partial plan is previewed: its feasibility and its first milestones.
+  await expect(page.getByText('STALE Map the exam domains')).toBeVisible();
+  await expect(page.getByText('STALE reason from the model that stalled.')).toBeVisible();
+  await expect(page.getByText('Gemini: Tight')).toBeVisible();
+
+  // 2. It stalls. The server sends `reset` and switches models. The next model waits 1.5 s before its first
+  //    chunk, so for that moment the page must show NOTHING from either model: the stale preview is gone
+  //    because of `reset`, not because the next model's milestones happened to overwrite it later.
+  const switched = page.getByText(
+    /gemini-e2e-mock stopped responding\. Starting over with gemini-e2e-fallback/,
+  );
+  await expect(switched).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText('Map the exam domains', { exact: true })).toHaveCount(0); // next model: nothing yet
+  await expect(page.getByText(/STALE/)).toHaveCount(0, { timeout: 400 });
+  await expect(page.getByText('Gemini: Tight')).toHaveCount(0, { timeout: 400 }); // stale feasibility badge
+  await expect(page.getByText('Map the exam domains', { exact: true })).toHaveCount(0); // still in the gap
+
+  // 3. The next model's milestones stream in, and only its plan is saved.
+  await expect(page.getByText('Map the exam domains', { exact: true }).first()).toBeVisible({
+    timeout: 10_000,
+  });
+  await expect(page.getByText(/STALE/)).toHaveCount(0);
+  await page.waitForURL(/\/review$/, { timeout: 60_000 });
+  await expect(page.getByText(/Map the exam domains/).first()).toBeVisible();
+  await expect(page.getByText(/STALE/)).toHaveCount(0);
+});

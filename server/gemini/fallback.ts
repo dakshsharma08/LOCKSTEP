@@ -14,6 +14,8 @@
  *     drops out by itself. GEMINI_MODEL_FALLBACKS overrides it.
  *   • Hard cap on upstream calls per plan: 1 + primaryRetries + fallbacks (default 4 calls in total).
  *     503s also count against rate limits, so hammering a struggling API makes things worse.
+ *   • A model that STALLS mid-answer (no chunk within the limit, or its own stream time used up) is
+ *     abandoned and the next model starts from scratch; the browser is told to drop the partial output.
  *   • An alternative that is itself temporarily unavailable, or not available to this key (404), is
  *     skipped. Any OTHER error from an alternative (a 400 such as "schema has too many states", a 403…)
  *     stops the chain and is reported as it is, with the earlier attempts listed: trying yet another
@@ -149,6 +151,20 @@ export function isTemporaryUnavailable(err: unknown): boolean {
   return false;
 }
 
+/**
+ * A model that accepted the request and started answering, then went silent longer than the app allows
+ * between chunks, or used up its own per-stream time. Its partial output is thrown away (the browser gets a
+ * `reset` event) and the next model starts from scratch. NOT the shared plan time limit
+ * ("phase: plan-time-limit"): when that fires, nothing new is started.
+ */
+export function isStreamStall(err: unknown): boolean {
+  return (
+    err instanceof AppError &&
+    err.code === 'TIMEOUT' &&
+    (err.details ?? []).some((x) => /^phase: streaming\b/.test(x))
+  );
+}
+
 /** A 404 from Google: this model is not available to this key (retired, or not offered to new users). */
 export function isModelUnavailable(err: unknown): boolean {
   return err instanceof AppError && (err.details ?? []).some((x) => /^Gemini status 404/.test(x));
@@ -261,12 +277,13 @@ export async function runWithFallback<T>(
       return { value: await run(model, retries), model, tried };
     } catch (err) {
       if (err instanceof AppError && err.code === 'CANCELLED') throw err;
-      // On the primary only a TEMPORARY failure justifies switching models.
-      if (model === pool.primary && !isTemporaryUnavailable(err)) throw err;
-      // On an alternative, also a 404 (that model is not available to this key). Anything else is real.
-      if (model !== pool.primary && !isTemporaryUnavailable(err) && !isModelUnavailable(err)) {
-        throw stoppedAt(err, model, tried);
-      }
+      // Switching models is justified only by a TEMPORARY failure or a STALL (any model), or, on an
+      // alternative, a 404 (that model is not available to this key). Anything else (400, 403…) is real.
+      const movesOn =
+        isTemporaryUnavailable(err) ||
+        isStreamStall(err) ||
+        (model !== pool.primary && isModelUnavailable(err));
+      if (!movesOn) throw model === pool.primary ? err : stoppedAt(err, model, tried);
       tried.push({ model, error: err });
 
       queue ??= (await pool.fallbacks().catch(() => [] as string[]))

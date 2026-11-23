@@ -19,7 +19,7 @@ import type { AiTuning } from '../lib/config';
 import { AppError, isRetryableUpstream, toAppError, upstreamStatus } from '../lib/errors';
 import { withRetry } from '../lib/retry';
 import { upstreamReason } from '../lib/redact';
-import { raceAbort, timeoutError, withTimeout } from '../lib/timeout';
+import { raceAbort, withTimeout } from '../lib/timeout';
 import type { GeminiLike } from './client';
 
 /** Everything a Gemini call needs, bundled per HTTP request. */
@@ -196,6 +196,11 @@ const stallPhase = (ph: Phases): StallPhase =>
       ? 'waiting-for-first-chunk'
       : 'streaming';
 
+/** A TIMEOUT that says which phase it hit ("phase: streaming (…)", "phase: waiting-for-first-chunk (…)"). */
+function stageTimeout(what: string, phase: string): AppError {
+  return new AppError('TIMEOUT', undefined, { details: [what, `phase: ${phase}`] });
+}
+
 /**
  * The first-chunk timeout, worded by WHICH wait timed out. "No first chunk" alone hides the
  * difference between "Google never answered" (network) and "Google answered but the model
@@ -235,7 +240,15 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
   const totalCtrl = new AbortController();
   const total = AbortSignal.any([ctx.signal, totalCtrl.signal]);
   const totalTimer = setTimeout(
-    () => totalCtrl.abort(timeoutError(`Stream exceeded ${Math.round(t.streamTotalTimeoutMs / 1000)} s`)),
+    () =>
+      totalCtrl.abort(
+        // The phase at the moment the cap hit: "streaming" means this model started answering and ran out
+        // of its own time (gemini/fallback.ts treats that as a stall and may start over on another model).
+        stageTimeout(
+          `Stream exceeded ${Math.round(t.streamTotalTimeoutMs / 1000)} s`,
+          `${stallPhase(ph)} (stream time limit)`,
+        ),
+      ),
     t.streamTotalTimeoutMs,
   );
 
@@ -339,7 +352,10 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
         const idle = setTimeout(
           () =>
             attemptCtrl.abort(
-              timeoutError(`Stream paused for more than ${Math.round(t.chunkIdleTimeoutMs / 1000)} s`),
+              stageTimeout(
+                `Stream paused for more than ${Math.round(t.chunkIdleTimeoutMs / 1000)} s`,
+                `streaming (no new chunk after ${ph.chunks} chunks: ${ph.thoughtChunks} thinking, ${ph.textChunks} text)`,
+              ),
             ),
           t.chunkIdleTimeoutMs,
         );

@@ -605,3 +605,188 @@ describe("the app's ai_diag line shows how the stream went (thinking vs text, ti
     expect(done.lastChunkMs).toBeGreaterThanOrEqual(done.firstTextMs);
   });
 });
+
+// ─── Stage 2: a model that stalls mid-answer is abandoned; the browser is told to drop its partial output ───
+
+/** A plan whose titles say STALE, streamed in 4 pieces; only the first `n` pieces are sent, then silence. */
+const staleThenStall = (r: FakeRequest, n = 2): FakeReply => {
+  const p = fixturePlan(r.body) as {
+    feasibility: string;
+    feasibilityReason: string;
+    milestones: { title: string; tasks: { title: string }[] }[];
+  };
+  p.feasibility = 'Tight';
+  p.feasibilityReason = 'STALE reason from the model that stalled.';
+  for (const m of p.milestones) {
+    m.title = `STALE ${m.title}`;
+    for (const t of m.tasks) t.title = `STALE ${t.title}`;
+  }
+  return { text: JSON.stringify(p), stallAfterChunks: n };
+};
+const STALL_TUNING = { chunkIdleTimeoutMs: 200 };
+const isStale = (e: Sse) =>
+  (e.event === 'milestone' && /STALE/.test(e.data.milestone.title)) ||
+  (e.event === 'feasibility' && /STALE/.test(e.data.feasibilityReason));
+
+describe('stall after partial output → reset → next model', () => {
+  it('primary stalls after streaming part of a plan: reset comes BEFORE anything from the next model', async () => {
+    const base = await start(
+      (r) => (r.stream && r.model === PRIMARY ? staleThenStall(r) : undefined),
+      {},
+      STALL_TUNING,
+    );
+    const events = await plan(base);
+    const reset = events.findIndex((e) => e.event === 'reset');
+
+    expect(events.at(-1)?.event).toBe('result');
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash']); // no same-model retry after output started
+    // The abandoned attempt really had shown something (so the reset matters)…
+    expect(events.slice(0, reset).some(isStale)).toBe(true);
+    // …the reset names the switch, and is followed by the status, then the new model's events only.
+    expect(events[reset]!.data).toEqual({ reason: 'stalled', from: PRIMARY, to: 'gemini-3.5-flash' });
+    expect(events[reset + 1]).toMatchObject({
+      event: 'status',
+      data: { message: `${PRIMARY} stopped responding. Starting over with gemini-3.5-flash…` },
+    });
+    expect(events.slice(reset + 1).some(isStale)).toBe(false);
+    expect(events.slice(reset + 1).some((e) => e.event === 'milestone')).toBe(true);
+  });
+
+  it("the abandoned output is never validated or saved: the result is entirely the new model's plan", async () => {
+    const base = await start(
+      (r) => (r.stream && r.model === PRIMARY ? staleThenStall(r) : undefined),
+      {},
+      STALL_TUNING,
+    );
+    const events = await plan(base);
+    const result = events.at(-1)!.data;
+
+    expect(JSON.stringify(result.plan)).not.toMatch(/STALE/);
+    expect(result.repaired).toBe(false);
+    expect(repairs()).toHaveLength(0); // the partial text was never sent anywhere
+    const validating = events.filter((e) => e.event === 'status' && e.data.phase === 'validating');
+    expect(validating).toHaveLength(1); // validated once: the successful attempt only
+    expect(result.runs.map((r: { model: string; ok: boolean }) => [r.model, r.ok])).toEqual([
+      [PRIMARY, false],
+      ['gemini-3.5-flash', true],
+    ]);
+    const fb = diag().find((d) => d.event === 'model_fallback')!;
+    expect(fb).toMatchObject({ from: PRIMARY, to: 'gemini-3.5-flash', stalled: true });
+    expect(fb.reason).toMatch(
+      /Stream paused for more than 0 s \| phase: streaming \(no new chunk after 2 chunks: 0 thinking, 2 text\)/,
+    );
+  });
+
+  it('a model that only thought and then went silent also counts as a stall', async () => {
+    const base = await start(
+      (r) => (r.stream && r.model === PRIMARY ? { thoughtAfterMs: 10, stallAfterChunks: 0 } : undefined),
+      {},
+      STALL_TUNING,
+    );
+    const events = await plan(base);
+    expect(events.at(-1)?.event).toBe('result');
+    expect(events.find((e) => e.event === 'reset')?.data.reason).toBe('stalled');
+  });
+
+  it('quota 429 on the primary, then 3.5 stalls mid-answer: 3.6 writes the plan (3 calls, two resets in order)', async () => {
+    const base = await start(
+      (r) =>
+        r.stream && r.model === PRIMARY
+          ? QUOTA
+          : r.stream && r.model === 'gemini-3.5-flash'
+            ? staleThenStall(r)
+            : undefined,
+      {},
+      STALL_TUNING,
+    );
+    const events = await plan(base);
+
+    expect(events.at(-1)?.event).toBe('result');
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash', 'gemini-3.6-flash']);
+    expect(events.filter((e) => e.event === 'reset').map((e) => [e.data.reason, e.data.to])).toEqual([
+      ['unavailable', 'gemini-3.5-flash'],
+      ['stalled', 'gemini-3.6-flash'],
+    ]);
+    const lastReset = events.map((e) => e.event).lastIndexOf('reset');
+    expect(events.slice(lastReset).some(isStale)).toBe(false);
+    expect(events.at(-1)!.data.runs.at(-1)).toMatchObject({ model: 'gemini-3.6-flash', ok: true });
+  });
+
+  it('every model stalls: an honest error, never more than the 4-call cap', async () => {
+    const base = await start((r) => (r.stream ? staleThenStall(r) : undefined), {}, STALL_TUNING);
+    const err = (await plan(base)).at(-1)!;
+
+    expect(err.event).toBe('error');
+    expect(err.data.code).toBe('AI_BUSY');
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash', 'gemini-3.6-flash']);
+    expect(streams().length).toBeLessThanOrEqual(4);
+  });
+
+  it('400 and 403 never trigger a fallback or a reset', async () => {
+    for (const error of [
+      { status: 400, code: 'INVALID_ARGUMENT', message: 'Request contains an invalid argument.' },
+      { status: 403, code: 'PERMISSION_DENIED', message: 'Permission denied.' },
+    ]) {
+      const base = await start((r) => (r.stream ? { error } : undefined), {}, STALL_TUNING);
+      const events = await plan(base);
+      expect(events.at(-1)?.event).toBe('error');
+      expect(events.some((e) => e.event === 'reset')).toBe(false);
+      expect(streams()).toEqual([PRIMARY]);
+      server?.close();
+      await fake?.close();
+    }
+  });
+
+  it('after a 429 on the primary, a 400 on 3.5 stops the chain: no reset towards 3.6', async () => {
+    const base = await start(
+      (r) => (r.stream && r.model === PRIMARY ? QUOTA : r.stream ? SCHEMA_400 : undefined),
+      {},
+      STALL_TUNING,
+    );
+    const events = await plan(base);
+    expect(events.at(-1)?.data.code).toBe('INTERNAL');
+    expect(events.filter((e) => e.event === 'reset').map((e) => e.data.to)).toEqual(['gemini-3.5-flash']);
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash']);
+  });
+
+  it('a stall when too little of the plan time limit is left: no next model, no reset', async () => {
+    const base = await start(
+      (r) => (r.stream && r.model === PRIMARY ? staleThenStall(r) : undefined),
+      {},
+      {
+        chunkIdleTimeoutMs: 300,
+        planBudgetMs: 1500,
+        minAttemptMs: 1400,
+      },
+    );
+    const events = await plan(base);
+    const err = events.at(-1)!;
+
+    expect(err.event).toBe('error');
+    expect(err.data.details.at(-1)).toMatch(
+      /^No further model was tried: only \d+ s of the planning time limit was left\.$/,
+    );
+    expect(events.some((e) => e.event === 'reset')).toBe(false);
+    expect(streams()).toEqual([PRIMARY]);
+  });
+
+  it('the plan time limit firing mid-stream is not a stall: TIMEOUT, no next model, no reset', async () => {
+    const base = await start(
+      (r) => (r.stream ? staleThenStall(r) : undefined),
+      {},
+      {
+        chunkIdleTimeoutMs: 5000,
+        streamTotalTimeoutMs: 5000,
+        planBudgetMs: 600,
+        minAttemptMs: 100,
+      },
+    );
+    const events = await plan(base);
+    const err = events.at(-1)!;
+
+    expect(err.data.code).toBe('TIMEOUT');
+    expect(err.data.details.join(' ')).toMatch(/plan-time-limit/);
+    expect(events.some((e) => e.event === 'reset')).toBe(false);
+    expect(streams()).toEqual([PRIMARY]);
+  });
+});

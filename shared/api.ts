@@ -75,6 +75,16 @@ export interface PlanMilestoneEvent {
   index: number;
   milestone: PlanMilestone;
 }
+/**
+ * The plan is starting over on another model. Everything previewed so far (milestones, feasibility) came
+ * from an attempt that was abandoned and must be dropped. Always sent BEFORE the next model's first event.
+ */
+export interface PlanResetEvent {
+  /** 'stalled': the model went silent mid-answer; 'unavailable': busy, over quota or not available. */
+  reason: 'stalled' | 'unavailable';
+  from: string;
+  to: string;
+}
 export interface PlanResult {
   plan: Plan;
   checks: PlanCheck[];
@@ -93,6 +103,7 @@ export type PlanStreamEvent =
   | { event: 'status'; data: PlanStatusEvent }
   | { event: 'feasibility'; data: PlanFeasibilityEvent }
   | { event: 'milestone'; data: PlanMilestoneEvent }
+  | { event: 'reset'; data: PlanResetEvent }
   | { event: 'result'; data: PlanResult }
   | { event: 'error'; data: ApiError };
 

@@ -28,7 +28,7 @@ import { dayKey, localToUtcIso, type DstAdjustment } from '../../shared/time';
 import type { ThinkingConfig } from '@google/genai';
 import { AppError } from '../lib/errors';
 import { remainingMs, streamGemini, type CallContext } from './call';
-import { runWithFallback, type ModelPool } from './fallback';
+import { isStreamStall, runWithFallback, type ModelPool } from './fallback';
 import { isThinkingRejection, planThinkingConfig, thinkingFallbacks, type PlanThinking } from './thinking';
 import { buildPlanSystemInstruction, buildPlanUserParts } from './prompts';
 import { repairPlan } from './repair';
@@ -185,16 +185,27 @@ export async function generatePlan(
   // (validation, repair, feasibility) is identical whichever model produced the plan.
   const { value: text, model } = await runWithFallback(pool, streamFrom, {
     onFallback: ({ from, to, error }) => {
+      const stalled = isStreamStall(error);
       call.recorder.diag({
         event: 'model_fallback',
         kind: 'plan',
         from,
         to,
+        stalled,
         reason: error instanceof AppError ? (error.details ?? [error.message]).join(' | ') : 'unknown',
       });
+      // FIRST tell the browser to drop whatever the abandoned attempt showed. This runs before the next
+      // model's request is even sent, so no event of the next attempt can come before it. (Nothing from
+      // the abandoned attempt is validated or saved: only the successful attempt's text is returned.)
+      emit({ event: 'reset', data: { reason: stalled ? 'stalled' : 'unavailable', from, to } });
       emit({
         event: 'status',
-        data: { phase: 'thinking', message: `Gemini is busy right now. Trying ${to} instead…` },
+        data: {
+          phase: 'thinking',
+          message: stalled
+            ? `${from} stopped responding. Starting over with ${to}…`
+            : `Gemini is busy right now. Trying ${to} instead…`,
+        },
       });
     },
   });

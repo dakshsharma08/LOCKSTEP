@@ -51,7 +51,11 @@ export default function PlanningPage() {
           if (c.signal.aborted) return;
           if (e.event === 'status') setStatus(e.data);
           else if (e.event === 'feasibility') setFeas(e.data);
-          else if (e.event === 'milestone')
+          else if (e.event === 'reset') {
+            // The plan is starting over on another model: drop the abandoned attempt's preview.
+            setMilestones([]);
+            setFeas(null);
+          } else if (e.event === 'milestone')
             setMilestones((prev) => {
               const next = [...prev];
               next[e.data.index] = e.data.milestone;

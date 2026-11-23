@@ -1,22 +1,33 @@
 /**
  * TEST-ONLY API server for Playwright E2E runs.
  *
- * It starts the real LOCKSTEP Express app, but MSW intercepts the HTTPS calls the
- * Gemini SDK makes and answers with deterministic fixtures. This file is never used by
- * `npm run dev`, `npm start` or the deployed app. The fake model is named
+ * It starts the real LOCKSTEP Express app and points its Gemini SDK client at a small LOCAL HTTP server
+ * that answers with deterministic fixtures (real HTTP + Server-Sent Events, like Google). This file is
+ * never used by `npm run dev`, `npm start` or the deployed app. The fake model is named
  * "gemini-e2e-mock" so evidence screenshots can't be mistaken for real Gemini output.
+ *
+ * Why a local server and not MSW: the app aborts a Gemini stream that stalls mid-answer, and with
+ * MSW 3 on Node 22 aborting a mocked response body crashes the process (undici: assert(!this.aborted)).
+ * A real socket behaves like Google does.
  */
-import { setupServer } from 'msw/node';
-import { http, HttpResponse } from 'msw';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { GoogleGenAI } from '@google/genai';
 
 process.env.GEMINI_API_KEY = 'e2e-fake-key-not-real';
 process.env.GEMINI_MODEL = 'gemini-e2e-mock';
 process.env.ALLOWED_ORIGINS = 'http://localhost:4173,http://localhost:5173';
+// One fake alternative model, so the "stall → reset → next model" scenario can run in the browser.
+process.env.GEMINI_MODEL_FALLBACKS = 'gemini-e2e-fallback';
 
-const STREAM =
-  /^https:\/\/generativelanguage\.googleapis\.com\/v1[a-z0-9]*\/models\/[^/:]+:streamGenerateContent/;
-const GENERATE =
-  /^https:\/\/generativelanguage\.googleapis\.com\/v1[a-z0-9]*\/models\/[^/:]+:generateContent/;
+/**
+ * Scenario marker: a goal containing this text makes the primary fake model stream part of a STALE plan and
+ * then go silent; the app must abandon it, send `reset`, and get the plan from gemini-e2e-fallback.
+ */
+const STALL_MARKER = 'e2e-stall';
+
+/** /v1beta/models, /v1beta/models/<model>:generateContent, /v1beta/models/<model>:streamGenerateContent */
+const ROUTE = /^\/(v1[a-z0-9]*)\/models(?:\/([^/:]+):(generateContent|streamGenerateContent))?$/;
 
 type Body = {
   systemInstruction?: { parts: { text: string }[] };
@@ -77,40 +88,54 @@ function fixturePlan(body: Body) {
   };
 }
 
-const enc = new TextEncoder();
-function sse(text: string) {
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Stream `text` as SSE chunks (180 characters, one every 60 ms), like Google's streamGenerateContent.
+ * stallAfter: send only that many chunks, then go silent with the connection open (the app's idle limit
+ * ends it by aborting the request). firstDelayMs: wait this long before the first chunk.
+ */
+async function streamText(
+  req: IncomingMessage,
+  res: ServerResponse,
+  text: string,
+  opts: { stallAfter?: number; firstDelayMs?: number } = {},
+) {
   const parts = text.match(/.{1,180}/gs) ?? [text];
-  const chunks = parts.map((t, i) =>
-    enc.encode(
+  let gone = false;
+  req.on('close', () => (gone = true));
+  res.on('close', () => (gone = true));
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+  res.flushHeaders();
+  for (let i = 0; i < parts.length; i++) {
+    await wait(i === 0 && opts.firstDelayMs ? opts.firstDelayMs : 60);
+    if (gone) return;
+    if (opts.stallAfter !== undefined && i >= opts.stallAfter) return; // silence: no more chunks, no end
+    const last = i === parts.length - 1;
+    res.write(
       `data: ${JSON.stringify({
         candidates: [
           {
-            content: { role: 'model', parts: [{ text: t }] },
+            content: { role: 'model', parts: [{ text: parts[i] }] },
             index: 0,
-            ...(i === parts.length - 1 ? { finishReason: 'STOP' } : {}),
+            ...(last ? { finishReason: 'STOP' } : {}),
           },
         ],
-        ...(i === parts.length - 1 ? { usageMetadata: { totalTokenCount: 1234 } } : {}),
+        ...(last ? { usageMetadata: { totalTokenCount: 1234 } } : {}),
         modelVersion: 'gemini-e2e-mock',
       })}\r\n\r\n`,
-    ),
-  );
-  let i = 0;
-  return new HttpResponse(
-    new ReadableStream({
-      async pull(c) {
-        await new Promise((r) => setTimeout(r, 60));
-        const next = chunks[i++];
-        if (next) c.enqueue(next);
-        else c.close();
-      },
-    }),
-    { headers: { 'Content-Type': 'text/event-stream' } },
-  );
+    );
+  }
+  res.end();
 }
 
-function json(obj: unknown) {
-  return HttpResponse.json({
+function sendJson(res: ServerResponse, obj: unknown) {
+  res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(obj));
+}
+
+/** One non-streamed answer whose text is `obj` as JSON. */
+function answer(res: ServerResponse, obj: unknown) {
+  sendJson(res, {
     candidates: [
       { content: { role: 'model', parts: [{ text: JSON.stringify(obj) }] }, finishReason: 'STOP', index: 0 },
     ],
@@ -119,38 +144,73 @@ function json(obj: unknown) {
   });
 }
 
-const LIST = /^https:\/\/generativelanguage\.googleapis\.com\/v1[a-z0-9]*\/models(\?.*)?$/;
+async function handle(req: IncomingMessage, res: ServerResponse) {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const route = ROUTE.exec(url.pathname);
+  let raw = '';
+  for await (const chunk of req) raw += chunk;
+  if (!route) {
+    res
+      .writeHead(404, { 'content-type': 'application/json' })
+      .end('{"error":{"code":404,"status":"NOT_FOUND"}}');
+    return;
+  }
+  const [, , model, method] = route;
 
-const mock = setupServer(
-  // The app lists the key's models in the background (for fallbacks); answer it here so tests stay offline.
-  http.get(LIST, () =>
-    HttpResponse.json({
+  if (!model) {
+    // The app lists the key's models (model choice, image discovery). Only the e2e model exists.
+    sendJson(res, {
       models: [{ name: 'models/gemini-e2e-mock', supportedGenerationMethods: ['generateContent'] }],
-    }),
-  ),
-  http.post(STREAM, async ({ request }) => sse(JSON.stringify(fixturePlan((await request.json()) as Body)))),
-  http.post(GENERATE, async ({ request }) => {
-    const body = (await request.json()) as Body & { tools?: unknown };
-    const keys = Object.keys(body.generationConfig?.responseJsonSchema?.properties ?? {});
-    if (keys.includes('line')) return json({ line: 'Fixture line: one focused session today.' });
-    if (keys.includes('summary')) return json({ summary: 'Fixture summary: steady week.' });
-    if (keys.includes('milestones')) return json(fixturePlan(body));
-    return HttpResponse.json({
-      candidates: [
-        {
-          content: { role: 'model', parts: [{ text: 'Fixture coach reply: you are on track.' }] },
-          finishReason: 'STOP',
-          index: 0,
-        },
-      ],
-      usageMetadata: { totalTokenCount: 80 },
     });
-  }),
-);
-mock.listen(); // MSW v3: unmatched requests pass through to the network by default
+    return;
+  }
+
+  const body = (raw ? JSON.parse(raw) : {}) as Body & { tools?: unknown };
+  if (method === 'streamGenerateContent') {
+    const plan = fixturePlan(body);
+    if (!raw.includes(STALL_MARKER)) return streamText(req, res, JSON.stringify(plan));
+    if (model === 'gemini-e2e-fallback') {
+      // The alternative: a short pause first, so the browser test can see the cleared preview.
+      return streamText(req, res, JSON.stringify(plan), { firstDelayMs: 1500 });
+    }
+    // The primary: part of a STALE plan (feasibility + the first two milestones), then silence.
+    const stale = {
+      ...plan,
+      feasibility: 'Tight',
+      feasibilityReason: 'STALE reason from the model that stalled.',
+      milestones: plan.milestones.map((m) => ({ ...m, title: `STALE ${m.title}` })),
+    };
+    const text = JSON.stringify(stale);
+    return streamText(req, res, text, { stallAfter: Math.ceil(text.indexOf('"id":"m3"') / 180) });
+  }
+
+  const keys = Object.keys(body.generationConfig?.responseJsonSchema?.properties ?? {});
+  if (keys.includes('line')) return answer(res, { line: 'Fixture line: one focused session today.' });
+  if (keys.includes('summary')) return answer(res, { summary: 'Fixture summary: steady week.' });
+  if (keys.includes('milestones')) return answer(res, fixturePlan(body));
+  sendJson(res, {
+    candidates: [
+      {
+        content: { role: 'model', parts: [{ text: 'Fixture coach reply: you are on track.' }] },
+        finishReason: 'STOP',
+        index: 0,
+      },
+    ],
+    usageMetadata: { totalTokenCount: 80 },
+  });
+}
+
+const fakeGemini = createServer((req, res) => void handle(req, res).catch(() => res.destroy()));
+await new Promise<void>((r) => fakeGemini.listen(0, '127.0.0.1', r));
+const geminiBase = `http://127.0.0.1:${(fakeGemini.address() as AddressInfo).port}`;
 
 const { createApp } = await import('../server/app');
 const port = Number(process.env.PORT) || 8787;
-createApp({ tuning: { rateLimit: { windowMax: 1000, dayMax: 10000 } } }).listen(port, () =>
-  console.log(`E2E mock API (fixtures, NOT real Gemini) on :${port}`),
-);
+createApp({
+  gemini: new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY,
+    httpOptions: { baseUrl: geminiBase },
+  }) as never,
+  // chunkIdleTimeoutMs: 1.5 s instead of 30 s so the stall scenario is quick (normal chunks come every 60 ms).
+  tuning: { rateLimit: { windowMax: 1000, dayMax: 10000 }, chunkIdleTimeoutMs: 1500 },
+}).listen(port, () => console.log(`E2E mock API (fixtures, NOT real Gemini) on :${port}`));
