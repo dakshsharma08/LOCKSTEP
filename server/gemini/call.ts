@@ -16,7 +16,8 @@ import type { AiKind, AiRunMeta } from '../../shared/api';
 import type { RunRecorder } from '../lib/aiRuns';
 import { runMeta } from '../lib/aiRuns';
 import type { AiTuning } from '../lib/config';
-import { AppError, isRetryableUpstream, toAppError, upstreamStatus } from '../lib/errors';
+import { AppError, coolingDown, isRetryableUpstream, toAppError, upstreamStatus } from '../lib/errors';
+import type { ModelHealth } from './modelHealth';
 import { withRetry } from '../lib/retry';
 import { googleErrorInfo, upstreamReason } from '../lib/redact';
 import { raceAbort, withTimeout } from '../lib/timeout';
@@ -33,6 +34,8 @@ export interface CallContext {
   deadlineMs?: number;
   /** Every attempt is appended here and returned to the client. */
   runs: AiRunMeta[];
+  /** Per-model cooldown shared by all requests (gemini/modelHealth.ts). Omitted = no cooldowns. */
+  health?: ModelHealth;
 }
 
 export interface CallArgs {
@@ -107,6 +110,9 @@ function record(ctx: CallContext, meta: AiRunMeta) {
 export async function callGemini(ctx: CallContext, args: CallArgs): Promise<GenerateContentResponse> {
   const t = ctx.tuning;
   const timeoutMs = args.timeoutMs ?? t.callTimeoutMs;
+  // A model that failed moments ago is not called again until its cooldown is over (no request).
+  const coolMs = ctx.health?.coolingFor(args.model) ?? 0;
+  if (coolMs > 0) throw coolingDown(args.model, coolMs, ctx.health?.reasonFor(args.model) ?? null);
   let response: GenerateContentResponse;
   let callAttempts = 0;
   try {
@@ -127,6 +133,7 @@ export async function callGemini(ctx: CallContext, args: CallArgs): Promise<Gene
             `No answer within ${Math.round(timeoutMs / 1000)} s`,
           );
           record(ctx, runMeta(args.kind, args.model, started, true, tokensOf(response)));
+          ctx.health?.markSuccess(args.model);
           return response;
         } catch (err) {
           record(ctx, runMeta(args.kind, args.model, started, false, null));
@@ -209,6 +216,10 @@ function logFailure(
 ): void {
   const mapped = toAppError(f.err, f.signal);
   if (mapped.code === 'CANCELLED') return;
+  // Remember the failure so the next requests skip this model for a while, unless it was not the
+  // model's fault (the request's own time limit ran out).
+  const planLimit = (mapped.details ?? []).some((d) => d.startsWith('phase: plan-time-limit'));
+  const cooldownMs = planLimit ? 0 : (ctx.health?.markFailure(f.model, f.err, mapped) ?? 0);
   const google = googleErrorInfo(f.err);
   ctx.recorder.error({
     kind: f.kind,
@@ -218,6 +229,7 @@ function logFailure(
     latencyMs: Date.now() - f.startedMs,
     appCode: mapped.code,
     appStatus: mapped.status,
+    ...(cooldownMs > 0 ? { cooldownSec: Math.ceil(cooldownMs / 1000) } : {}),
     ...(google ?? {}),
     // Our own failures (timeouts, cut-off answers) have no Google body: say what happened instead.
     ...(google ? {} : { cause: (mapped.details ?? [mapped.message]).join(' | ').slice(0, 300) }),
@@ -538,6 +550,7 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
     }
     record(ctx, runMeta(args.kind, args.model, started, true, tokensOf(lastUsage)));
     diag(true, { phase: 'done', tokens: tokensOf(lastUsage) });
+    ctx.health?.markSuccess(args.model);
     return text;
   } catch (err) {
     // attemptSignal carries our abort reason (TIMEOUT / CANCELLED) if we pressed stop.

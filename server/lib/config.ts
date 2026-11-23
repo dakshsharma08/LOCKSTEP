@@ -90,6 +90,12 @@ export interface AiTuning {
   rateLimit: { windowSec: number; windowMax: number; dayMax: number };
   /** Limits for trying alternative models when the primary is temporarily unavailable (see gemini/fallback.ts). */
   modelFallback: { primaryRetries: number; maxAttempts: number; maxFallbacks: number };
+  /**
+   * Per-model cooldown after a failure (gemini/modelHealth.ts): first cooldown up to baseMs, doubling per
+   * consecutive failure up to maxMs, with jitter; a daily quota is re-checked at most every dailyRecheckMs.
+   * baseMs 0 disables cooldowns.
+   */
+  cooldown: { baseMs: number; maxMs: number; dailyRecheckMs: number };
 }
 
 export const DEFAULT_TUNING: AiTuning = {
@@ -108,11 +114,13 @@ export const DEFAULT_TUNING: AiTuning = {
   rateLimit: { windowSec: 10 * 60, windowMax: 20, dayMax: 150 },
   // 1 call + 1 retry on the primary, then at most 2 alternatives: 4 upstream calls in the worst case.
   modelFallback: { primaryRetries: 1, maxAttempts: 4, maxFallbacks: 2 },
+  cooldown: { baseMs: 30_000, maxMs: 10 * 60_000, dailyRecheckMs: 60 * 60_000 },
 };
 
-export type TuningOverrides = Partial<Omit<AiTuning, 'rateLimit' | 'modelFallback'>> & {
+export type TuningOverrides = Partial<Omit<AiTuning, 'rateLimit' | 'modelFallback' | 'cooldown'>> & {
   rateLimit?: Partial<AiTuning['rateLimit']>;
   modelFallback?: Partial<AiTuning['modelFallback']>;
+  cooldown?: Partial<AiTuning['cooldown']>;
 };
 
 export function resolveTuning(over: TuningOverrides = {}): AiTuning {
@@ -121,5 +129,6 @@ export function resolveTuning(over: TuningOverrides = {}): AiTuning {
     ...over,
     rateLimit: { ...DEFAULT_TUNING.rateLimit, ...over.rateLimit },
     modelFallback: { ...DEFAULT_TUNING.modelFallback, ...over.modelFallback },
+    cooldown: { ...DEFAULT_TUNING.cooldown, ...over.cooldown },
   };
 }

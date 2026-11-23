@@ -114,12 +114,28 @@ export function isQuotaExhausted(err: unknown): boolean {
   return /quota/i.test(raw);
 }
 
-/** Statuses worth retrying ON THE SAME MODEL with backoff: 429 (unless the quota is used up), 500 and 503. */
+/**
+ * Statuses worth retrying ON THE SAME MODEL with backoff: 500, and a 429 that is not about quota.
+ * NOT 503 ("high demand"): on the free tier a retry seconds later rarely helps and costs a request, so the
+ * plan moves straight to the next model and the failing one cools down (gemini/modelHealth.ts).
+ */
 export function isRetryableUpstream(err: unknown): boolean {
   if (err instanceof AppError) return false;
   const s = upstreamStatus(err);
   if (s === 429) return !isQuotaExhausted(err);
-  return s === 500 || s === 503;
+  return s === 500;
+}
+
+/** Detail prefix of a model skipped because it is cooling down (see gemini/modelHealth.ts). */
+export const SKIPPED_COOLING = 'Skipped without a request:';
+
+/** The error recorded for a model skipped because it is cooling down: NO request was made. */
+export function coolingDown(model: string, ms: number, reason: string | null): AppError {
+  return new AppError('AI_BUSY', undefined, {
+    details: [
+      `${SKIPPED_COOLING} ${model} is cooling down for ${Math.ceil(ms / 1000)} s${reason ? ` after ${reason}` : ''}.`,
+    ],
+  });
 }
 
 function isAbortError(err: unknown): boolean {

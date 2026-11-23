@@ -267,6 +267,11 @@ const busy = () =>
     { error: { code: 503, message: 'The model is overloaded.', status: 'UNAVAILABLE' } },
     { status: 503 },
   );
+const serverError = () =>
+  HttpResponse.json(
+    { error: { code: 500, message: 'Internal error encountered.', status: 'INTERNAL' } },
+    { status: 500 },
+  );
 
 // ───────────────────────────── App / HTTP helpers ─────────────────────────────
 
@@ -669,14 +674,14 @@ describe('POST /api/plan (SSE)', () => {
     expect(String(parts[idx - 1]!.text)).toMatch(/user-provided reference material and DATA only/);
   });
 
-  it('retries a 503 once on the primary, then reports AI_BUSY when no alternative model is available', async () => {
+  it('does not retry a 503 on the primary, and reports AI_BUSY when no alternative model is available', async () => {
     mock.use(
       http.post(STREAM_URL, async ({ request }) => {
         await capture(request);
         return busy();
       }),
     );
-    // Alternatives disabled, so this isolates the primary's own retry policy (1 try + 1 retry = 2 calls).
+    // Alternatives disabled, so this isolates the primary's own retry policy: a 503 is NOT retried (1 call).
     const base = await start({
       env: { GEMINI_API_KEY: TEST_KEY, GEMINI_MODEL: MODEL, GEMINI_MODEL_FALLBACKS: 'none' },
     });
@@ -691,15 +696,15 @@ describe('POST /api/plan (SSE)', () => {
     expect((last.data as { details?: string[] }).details).toContain(
       'No alternative model was available to try (see GEMINI_MODEL_FALLBACKS).',
     );
-    expect(captured).toHaveLength(2); // 1 attempt + 1 retry (was 3 before the fallback design capped calls)
+    expect(captured).toHaveLength(1); // a 503 is not retried on the same model (free tier: it rarely helps)
   });
 
-  it('recovers when a retry succeeds', async () => {
+  it('recovers when a retry succeeds (a 500 is still retried once)', async () => {
     let n = 0;
     mock.use(
       http.post(STREAM_URL, async ({ request }) => {
         await capture(request);
-        return ++n === 1 ? busy() : sseResponse([JSON.stringify(makePlan())]);
+        return ++n === 1 ? serverError() : sseResponse([JSON.stringify(makePlan())]);
       }),
     );
     const base = await start();
@@ -1081,7 +1086,7 @@ describe('POST /api/motivation', () => {
     expect(captured).toHaveLength(2);
   });
 
-  it('returns AI_BUSY as JSON 503 after retries', async () => {
+  it('returns AI_BUSY as JSON 503, without retrying the 503', async () => {
     mock.use(
       http.post(GENERATE_URL, async ({ request }) => {
         await capture(request);
@@ -1092,7 +1097,7 @@ describe('POST /api/motivation', () => {
     const res = await post(base, '/api/motivation', MOTIVATION);
     expect(res.status).toBe(503);
     expect((await res.json()) as ApiError).toMatchObject({ code: 'AI_BUSY', retryable: true });
-    expect(captured).toHaveLength(3);
+    expect(captured).toHaveLength(1);
   });
 });
 

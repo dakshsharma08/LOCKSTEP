@@ -24,11 +24,13 @@ describe('same-model retries', () => {
     expect(isQuotaExhausted(quota)).toBe(true);
     expect(isRetryableUpstream(quota)).toBe(false);
   });
-  it('a 429 that is not about quota, a 503 and a 500 are still retried', () => {
+  it('a 429 that is not about quota and a 500 are still retried', () => {
     expect(isQuotaExhausted(plain429)).toBe(false);
     expect(isRetryableUpstream(plain429)).toBe(true);
-    expect(isRetryableUpstream(overloaded)).toBe(true);
     expect(isRetryableUpstream(googleError(500, 'Internal error', 'INTERNAL'))).toBe(true);
+  });
+  it('a 503 ("high demand") is NOT retried on the same model: the plan moves on and the model cools down', () => {
+    expect(isRetryableUpstream(overloaded)).toBe(false);
   });
   it('400, 403 and 404 are never retried', () => {
     for (const s of [400, 403, 404]) expect(isRetryableUpstream(googleError(s, 'no', 'X'))).toBe(false);

@@ -260,3 +260,10 @@ Sizes (the app's own prompt builders): input ≈ 1,400 tokens; a rich plan (7 mi
 - **Tested:** the order (whatever the primary, independent of list order, max 0/1/2/10, missing preferred models, slot filling); 3.6, 3.7 and 2.5 never picked even with room to spare; the default primary when listed, the old rule when not, the default when listing fails; end to end with every model returning 503: exactly 3.5-flash-lite (+1 retry) → 3.1-flash-lite → 3.5-flash (4 calls), 3.6 and 3.7 never called although the key lists them; the diagnostic shows the same chain. Mutation-checked (old order, 3.6 or 3.7 not excluded, old default: each fails tests).
 - **Not yet verified in the deployed app**: one real plan locally (`npm run dev`), then the Preview deployment.
 
+## 21. Free-tier protection: per-model cooldown, no same-model retry on 503
+
+- **Why:** on the Preview, `gemini-3.5-flash-lite` and `gemini-3.1-flash-lite` returned 503 ("high demand") and `gemini-3.5-flash` timed out, then 429 (quota), minutes after 3.5-flash-lite had produced a valid plan locally. Free-tier capacity changes minute to minute; re-calling failing models on every plan only burns quota.
+- **Change:** per-model cooldown (`server/gemini/modelHealth.ts`), cooling models skipped without a request (plan chain and the coach/motivation/insight calls), no same-model retry on 503. Chain unchanged: 3.5-flash-lite → 3.1-flash-lite → 3.5-flash.
+- **Tested:** unit (backoff steps and jitter bounds, cap, reset on success, stall/no-answer/cut-off, Google retryDelay, per-minute and daily quota with the hourly re-check, midnight Pacific in winter/summer/DST, no cooldown for 400/403/404/cancel or when disabled); integration on one running app (a 503 primary is not called by the next plan; all cooling → the next plan makes zero requests and says so; daily quota skipped; cooldown ends and success clears it; a 400 does not cool down; motivation shares the cooldown). Mutation-checked.
+- **Not verified against real Gemini yet** (next: push, Preview, one real plan).
+

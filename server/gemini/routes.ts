@@ -32,6 +32,7 @@ import { WeeklyInsightRequestSchema, generateWeeklyInsight } from './insight';
 import { MotivationRequestSchema, generateMotivation, type MotivationCache } from './motivation';
 import type { PlanThinking } from './thinking';
 import type { ModelPool } from './fallback';
+import type { ModelHealth } from './modelHealth';
 import { BackgroundRequestSchema, generateBackground, type ImageModelResolver } from './background';
 import { generatePlan, preparePlanJob } from './plan';
 
@@ -41,6 +42,8 @@ export interface AiDeps {
   models: ModelResolver | null;
   recorder: RunRecorder;
   tuning: AiTuning;
+  /** Per-model cooldown shared by all AI requests of this app (gemini/modelHealth.ts). */
+  health?: ModelHealth;
   now: () => Date;
   limiter: RateLimiter;
   motivationCache: MotivationCache;
@@ -77,7 +80,7 @@ function abortOnDisconnect(res: Response): AbortSignal {
 }
 
 function callContext(deps: AiDeps, gemini: GeminiLike, signal: AbortSignal): CallContext {
-  return { gemini, recorder: deps.recorder, tuning: deps.tuning, signal, runs: [] };
+  return { gemini, recorder: deps.recorder, tuning: deps.tuning, signal, runs: [], health: deps.health };
 }
 
 /**
@@ -156,6 +159,9 @@ export function createAiRouter(deps: AiDeps): Router {
         // Never START another model with too little of the plan time limit left.
         remainingMs: () => timeLimit.deadlineMs - Date.now(),
         minAttemptMs: deps.tuning.minAttemptMs,
+        // Skip (without a request) any model that failed moments ago and is still cooling down.
+        coolingFor: (m) => deps.health?.coolingFor(m) ?? 0,
+        coolingReason: (m) => deps.health?.reasonFor(m) ?? null,
       };
       const result = await generatePlan(call, job, pool, (e) => sse.send(e), {
         thinking: deps.planThinking,

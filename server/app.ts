@@ -22,6 +22,7 @@ import { createGeminiClient, ModelResolver, type GeminiLike } from './gemini/cli
 import { MotivationCache } from './gemini/motivation';
 import { createAiRouter } from './gemini/routes';
 import { createRunRecorder } from './lib/aiRuns';
+import { ModelHealth } from './gemini/modelHealth';
 import { registerSecrets } from './lib/redact';
 import { loadConfig, resolveTuning, type TuningOverrides } from './lib/config';
 import { AppError } from './lib/errors';
@@ -152,6 +153,7 @@ export function createApp(opts: CreateAppOptions = {}): Express {
       tuning,
       now,
       limiter,
+      health: new ModelHealth(tuning.cooldown),
       motivationCache: new MotivationCache(),
       planThinking: parsePlanThinking(config.planThinking),
       images: models

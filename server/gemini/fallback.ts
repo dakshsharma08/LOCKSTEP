@@ -23,7 +23,7 @@
  *     stops the chain and is reported as it is, with the earlier attempts listed: trying yet another
  *     model would hide a real problem behind a misleading "Gemini is busy".
  */
-import { AppError } from '../lib/errors';
+import { AppError, coolingDown, SKIPPED_COOLING } from '../lib/errors';
 import { redactSecrets } from '../lib/redact';
 import { isIncompleteAnswerError } from './call';
 
@@ -156,7 +156,8 @@ export function maxUpstreamCalls(l: ModelPlanLimits): number {
 export function isTemporaryUnavailable(err: unknown): boolean {
   if (!(err instanceof AppError)) return false;
   const d = err.details ?? [];
-  if (err.code === 'AI_BUSY') return d.some((x) => /^Gemini status \d+/.test(x));
+  if (err.code === 'AI_BUSY')
+    return d.some((x) => /^Gemini status \d+/.test(x) || x.startsWith(SKIPPED_COOLING));
   if (err.code === 'TIMEOUT') return d.some((x) => /phase: waiting-for-(http-response|first-chunk)/.test(x));
   return false;
 }
@@ -189,6 +190,10 @@ export interface ModelPool {
   remainingMs?: () => number;
   /** Don't START another model with less than this left (default 0). */
   minAttemptMs?: number;
+  /** How long a model is still cooling down after recent failures (ms, 0 = available). Omitted = never. */
+  coolingFor?: (model: string) => number;
+  /** Why it is cooling down, for the error details. */
+  coolingReason?: (model: string) => string | null;
 }
 
 export interface FallbackInfo {
@@ -287,7 +292,10 @@ export async function runWithFallback<T>(
   let queue: string[] | null = null;
 
   for (;;) {
+    const coolMs = pool.coolingFor?.(model) ?? 0;
     try {
+      // A model that failed moments ago is skipped WITHOUT a request (it counts as temporarily unavailable).
+      if (coolMs > 0) throw coolingDown(model, coolMs, pool.coolingReason?.(model) ?? null);
       return { value: await run(model, retries), model, tried };
     } catch (err) {
       if (err instanceof AppError && err.code === 'CANCELLED') throw err;

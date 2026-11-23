@@ -234,5 +234,11 @@ createApp({
     httpOptions: { baseUrl: geminiBase },
   }) as never,
   // chunkIdleTimeoutMs: 1.5 s instead of 30 s so the stall scenario is quick (normal chunks come every 60 ms).
-  tuning: { rateLimit: { windowMax: 1000, dayMax: 10000 }, chunkIdleTimeoutMs: 1500 },
+  // Cooldowns off: every browser test is an independent scenario against this ONE shared server, so a model
+  // that "failed" in one test must not be skipped in the next (cooldowns are tested in cooldown.test.ts).
+  tuning: {
+    rateLimit: { windowMax: 1000, dayMax: 10000 },
+    chunkIdleTimeoutMs: 1500,
+    cooldown: { baseMs: 0 },
+  },
 }).listen(port, () => console.log(`E2E mock API (fixtures, NOT real Gemini) on :${port}`));
