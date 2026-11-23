@@ -9,9 +9,9 @@
  * Rules (each one is covered by a test):
  *   • Only TEMPORARY failures on the primary trigger a fallback. A 400 (bad request), 401/403 (key) or
  *     404 (model missing) would fail on every model, so we show it instead of hiding it.
- *   • The alternatives come from the models YOUR key can actually call (models.list), never from a
- *     hard-coded list: Google retires models (gemini-2.5-* are being shut down), and a list written in
- *     advance could point at models that no longer exist. GEMINI_MODEL_FALLBACKS overrides it.
+ *   • The alternatives come from the models YOUR key can actually call (models.list): a preferred order
+ *     (gemini-3.6-flash, then gemini-3.5-flash) is applied only to models the key lists, so a retired model
+ *     drops out by itself. GEMINI_MODEL_FALLBACKS overrides it.
  *   • Hard cap on upstream calls per plan: 1 + primaryRetries + fallbacks (default 4 calls in total).
  *     503s also count against rate limits, so hammering a struggling API makes things worse.
  *   • A fallback that fails (even with a 404) is skipped, and the overall error stays an honest
@@ -60,41 +60,49 @@ function parseCandidate(raw: string): Candidate | null {
 }
 
 /**
+ * The default fallback order, from REAL diagnostics on the developer's key (2026-11-23), while the
+ * primary `gemini-3.8-flash` answered 503:
+ *   gemini-3.6-flash  OK in ~5 s     gemini-3.5-flash  OK in ~23 s
+ *   gemini-3.7-flash  503 / timeout  gemini-2.5-flash  404 (not available to new users)
+ * So 3.6 is tried first, then 3.5. A preferred model is only used if the key's own model list contains
+ * it, so a model Google retires later drops out by itself. GEMINI_MODEL_FALLBACKS overrides all of this.
+ */
+export const PREFERRED_FALLBACKS: readonly string[] = ['gemini-3.6-flash', 'gemini-3.5-flash'];
+
+/** Never part of the AUTOMATIC chain for now (see above). Still usable via GEMINI_MODEL_FALLBACKS. */
+export const EXCLUDED_FALLBACKS: readonly string[] = ['gemini-3.7-flash', 'gemini-2.5-flash'];
+
+/**
  * Choose up to `max` alternatives from the key's model list.
- * Order: the newest remaining stable Flash model first (best quality); the next pick prefers a
- * different model GENERATION than the ones already chosen (capacity is often per generation);
- * Flash-Lite models come after all Flash models.
+ * Order: the PREFERRED models that this key lists (in that order), then, only if there is still room, the
+ * newest remaining stable Flash model; Flash-Lite models come after all Flash models. Models in
+ * EXCLUDED_FALLBACKS are never picked automatically.
  */
 export function pickFallbacks(names: readonly string[], primary: string, max: number): string[] {
   const primaryName = primary.replace(/^models\//, '');
-  const primaryMajor = parseCandidate(primaryName)?.major ?? Number.NaN;
   const byNewest = (a: Candidate, b: Candidate) => b.major - a.major || b.minor - a.minor;
   const seen = new Set<string>();
   const pool = names
     .map(parseCandidate)
-    .filter((c): c is Candidate => !!c && c.name !== primaryName && !seen.has(c.name) && !!seen.add(c.name));
-  const ordered = [
-    ...pool.filter((c) => !c.lite).sort(byNewest),
-    ...pool.filter((c) => c.lite).sort(byNewest),
-  ];
+    .filter(
+      (c): c is Candidate =>
+        !!c &&
+        c.name !== primaryName &&
+        !EXCLUDED_FALLBACKS.includes(c.name) &&
+        !seen.has(c.name) &&
+        !!seen.add(c.name),
+    );
 
-  const out: Candidate[] = [];
-  const majors = new Set<number>([primaryMajor]);
-  while (out.length < max && ordered.length > 0) {
-    // The first pick is simply the best remaining; later picks prefer a generation not used yet.
-    const i =
-      out.length === 0
-        ? 0
-        : Math.max(
-            0,
-            ordered.findIndex((c) => !majors.has(c.major)),
-          );
-    const [pick] = ordered.splice(i, 1);
-    if (!pick) break;
-    out.push(pick);
-    majors.add(pick.major);
-  }
-  return out.map((c) => c.name);
+  const preferred = PREFERRED_FALLBACKS.flatMap((n) => pool.filter((c) => c.name === n)).slice(
+    0,
+    Math.max(0, max),
+  );
+  const rest = pool.filter((c) => !preferred.includes(c));
+  const ordered = [
+    ...rest.filter((c) => !c.lite).sort(byNewest),
+    ...rest.filter((c) => c.lite).sort(byNewest),
+  ];
+  return [...preferred, ...ordered].slice(0, Math.max(0, max)).map((c) => c.name);
 }
 
 /** Limits that keep the number of upstream calls small. */

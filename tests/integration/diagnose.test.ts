@@ -123,6 +123,26 @@ describe('diagnose: overloaded primary (HTTP 503) and the fallback chain', () =>
     expect(text).not.toContain(KEY);
   });
 
+  it("with the developer's real model list the chain is 3.8 → 3.6 → 3.5, and 3.7 / 2.5 are never tried", async () => {
+    const REAL = [
+      'gemini-3.8-flash',
+      'gemini-3.7-flash',
+      'gemini-3.6-flash',
+      'gemini-3.5-flash',
+      'gemini-2.5-flash',
+    ];
+    const { report, text } = await diagnose(
+      (r) => (r.model === 'gemini-3.8-flash' ? overloaded : {}),
+      { skipPlan: true },
+      REAL,
+    );
+
+    expect(report.alternatives.map((a) => a.model)).toEqual(['gemini-3.6-flash', 'gemini-3.5-flash']);
+    expect(text).toMatch(/Fallback chain: gemini-3\.8-flash → gemini-3\.6-flash → gemini-3\.5-flash/);
+    expect(text).not.toMatch(/gemini-3\.7-flash +(OK|FAIL)/);
+    expect(text).not.toMatch(/gemini-2\.5-flash +(OK|FAIL)/);
+  });
+
   it('generation 503 everywhere but the list works: NO WORKING ALTERNATIVE, and the flow fails honestly with AI_BUSY', async () => {
     const { report, text } = await diagnose((r) => (r.model ? overloaded : {}), {}, MODELS);
 

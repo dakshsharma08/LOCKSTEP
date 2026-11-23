@@ -19,10 +19,13 @@ import { startFakeGemini, type FakeGemini, type FakeReply, type FakeRequest } fr
 const KEY = `${['AI', 'za'].join('')}SyFAKE-fallback-key-0123456789abcdef`;
 const NOW = new Date('2026-11-23T12:00:00Z');
 const PRIMARY = 'gemini-3.8-flash';
-// What the fake says THIS key can call. 2.5 is listed here only to exercise the "different generation" rule.
+// What the fake says THIS key can call: the developer's real list (2026-11-23). 3.7 (503/timeout) and
+// 2.5 (404 for new users) are listed on purpose: they must still never be used by the automatic chain.
 const KEY_MODELS = [
   PRIMARY,
+  'gemini-3.7-flash',
   'gemini-3.6-flash',
+  'gemini-3.5-flash',
   'gemini-2.5-flash',
   'gemini-3-flash-preview',
   'gemini-3.8-flash-image',
@@ -156,15 +159,38 @@ describe('503 fallback', () => {
     expect(levelOf(fbReq)).toEqual({ includeThoughts: true, thinkingLevel: 'LOW' });
   });
 
-  it('first alternative also 503 → the next one, from a different generation, is used (4 calls = the cap)', async () => {
+  it('first alternative (3.6) also 503 → gemini-3.5-flash is next, never 3.7 or 2.5 (4 calls = the cap)', async () => {
     const base = await start(only(PRIMARY, 'gemini-3.6-flash'));
     const events = await plan(base);
 
     expect(events.at(-1)?.event).toBe('result');
-    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.6-flash', 'gemini-2.5-flash']);
-    const fbReq = fake!.requests.find((r) => r.stream && r.model === 'gemini-2.5-flash')!;
-    expect(levelOf(fbReq)).toEqual({ includeThoughts: true, thinkingBudget: 1024 }); // a 2.5 model takes a budget
-    expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-2.5-flash');
+    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.6-flash', 'gemini-3.5-flash']);
+    const fbReq = fake!.requests.find((r) => r.stream && r.model === 'gemini-3.5-flash')!;
+    expect(levelOf(fbReq)).toEqual({ includeThoughts: true, thinkingLevel: 'LOW' });
+    expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-3.5-flash');
+  });
+
+  it('everything 503 while 3.7 and 2.5 are listed: they are never called (only 3.6 and 3.5 are)', async () => {
+    const base = await start((r) => (r.stream ? OVERLOADED : undefined));
+    const events = await plan(base);
+
+    expect(events.at(-1)!.data.code).toBe('AI_BUSY');
+    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.6-flash', 'gemini-3.5-flash']);
+    expect(streams()).not.toContain('gemini-3.7-flash');
+    expect(streams()).not.toContain('gemini-2.5-flash');
+    expect(
+      diag()
+        .filter((d) => d.event === 'model_fallback')
+        .map((d) => d.to),
+    ).toEqual(['gemini-3.6-flash', 'gemini-3.5-flash']);
+  });
+
+  it('GEMINI_MODEL_FALLBACKS can still name an excluded model on purpose (the override wins)', async () => {
+    const base = await start(only(PRIMARY), { GEMINI_MODEL_FALLBACKS: 'gemini-3.7-flash' });
+    const events = await plan(base);
+
+    expect(events.at(-1)?.event).toBe('result');
+    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.7-flash']);
   });
 
   it('a primary that never answers (stall) also falls back, without being retried', async () => {
@@ -187,7 +213,7 @@ describe('503 fallback', () => {
     const events = await plan(base);
 
     expect(events.at(-1)?.event).toBe('result');
-    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.6-flash', 'gemini-2.5-flash']);
+    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.6-flash', 'gemini-3.5-flash']);
   });
 });
 
@@ -213,7 +239,7 @@ describe('an overloaded model list', () => {
 
 describe('total failure', () => {
   it('every model 503: an honest AI_BUSY, one detail line per model, and never more than 4 upstream calls', async () => {
-    const base = await start(only(PRIMARY, 'gemini-3.6-flash', 'gemini-2.5-flash'));
+    const base = await start(only(PRIMARY, 'gemini-3.6-flash', 'gemini-3.5-flash'));
     const events = await plan(base);
     const err = events.at(-1)!;
 
@@ -228,7 +254,7 @@ describe('total failure', () => {
     expect(err.data.details.map((d: string) => d.split(':')[0])).toEqual([
       PRIMARY,
       'gemini-3.6-flash',
-      'gemini-2.5-flash',
+      'gemini-3.5-flash',
     ]);
 
     expect(streams()).toHaveLength(4); // 2 on the primary + 1 + 1: the hard cap
