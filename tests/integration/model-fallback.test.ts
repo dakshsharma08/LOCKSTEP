@@ -6,7 +6,8 @@
  * behaves this way, which can only be shown against the real API (`npm run diagnose:gemini`, or planning
  * while the primary model is overloaded).
  *
- * gemini-3.8-flash stays the primary; alternatives come from the key's model list (or GEMINI_MODEL_FALLBACKS).
+ * These tests pin gemini-3.8-flash as the primary (GEMINI_MODEL); alternatives come from the key's model list
+ * (gemini-3.1-flash-lite, then gemini-3.5-flash) or GEMINI_MODEL_FALLBACKS.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GoogleGenAI } from '@google/genai';
@@ -27,13 +28,14 @@ import {
 const KEY = `${['AI', 'za'].join('')}SyFAKE-fallback-key-0123456789abcdef`;
 const NOW = new Date('2026-11-23T12:00:00Z');
 const PRIMARY = 'gemini-3.8-flash';
-// What the fake says THIS key can call: the developer's real list (2026-11-23). 3.7 (503/timeout) and
-// 2.5 (404 for new users) are listed on purpose: they must still never be used by the automatic chain.
+// What the fake says THIS key can call: the developer's real list (2026-11-23). 3.7 (timeouts), 3.6 (stalls,
+// 503s) and 2.5 (404 for new users) are listed on purpose: the automatic chain must never use them.
 const KEY_MODELS = [
   PRIMARY,
   'gemini-3.7-flash',
-  'gemini-3.5-flash',
   'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-3.1-flash-lite',
   'gemini-2.5-flash',
   'gemini-3-flash-preview',
   'gemini-3.8-flash-image',
@@ -142,7 +144,7 @@ describe('503 fallback', () => {
 
     expect(result.event).toBe('result');
     // gemini-3.8-flash is still tried first (and retried once); then ONE call to the alternative.
-    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.5-flash']);
+    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.1-flash-lite']);
     expect(listCalls()).toBe(1); // warmed once and cached: the fallback reuses it instead of asking again
 
     // The plan is validated exactly as before, whichever model wrote it.
@@ -150,47 +152,50 @@ describe('503 fallback', () => {
     expect(result.data.checks.every((c: { ok: boolean }) => c.ok)).toBe(true);
     expect(result.data.plan.feasibility).toBe('Achievable');
     // The honest label: the LAST run is the model that actually produced the plan.
-    expect(result.data.runs.at(-1)).toMatchObject({ model: 'gemini-3.5-flash', ok: true });
+    expect(result.data.runs.at(-1)).toMatchObject({ model: 'gemini-3.1-flash-lite', ok: true });
     expect(
       result.data.runs.filter((r: { ok: boolean }) => !r.ok).map((r: { model: string }) => r.model),
     ).toEqual([PRIMARY, PRIMARY]);
 
     // The user is told, and the log says why.
-    const note = events.find((e) => e.event === 'status' && /Trying gemini-3\.5-flash/.test(e.data.message));
+    const note = events.find(
+      (e) => e.event === 'status' && /Trying gemini-3\.1-flash-lite/.test(e.data.message),
+    );
     expect(note?.data.message).toMatch(/busy right now/);
     expect(diag().find((d) => d.event === 'model_fallback')).toMatchObject({
       from: PRIMARY,
-      to: 'gemini-3.5-flash',
+      to: 'gemini-3.1-flash-lite',
     });
     // The alternative still gets a thinking setting that suits ITS generation.
-    const fbReq = fake!.requests.find((r) => r.stream && r.model === 'gemini-3.5-flash')!;
+    const fbReq = fake!.requests.find((r) => r.stream && r.model === 'gemini-3.1-flash-lite')!;
     expect(levelOf(fbReq)).toEqual({ includeThoughts: true, thinkingLevel: 'LOW' });
   });
 
-  it('first alternative (3.5) also 503 → gemini-3.6-flash is next, never 3.7 or 2.5 (4 calls = the cap)', async () => {
-    const base = await start(only(PRIMARY, 'gemini-3.5-flash'));
+  it('first alternative (3.1-flash-lite) also 503 → gemini-3.5-flash is next, never 3.6, 3.7 or 2.5 (4 calls = the cap)', async () => {
+    const base = await start(only(PRIMARY, 'gemini-3.1-flash-lite'));
     const events = await plan(base);
 
     expect(events.at(-1)?.event).toBe('result');
-    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.5-flash', 'gemini-3.6-flash']);
-    const fbReq = fake!.requests.find((r) => r.stream && r.model === 'gemini-3.6-flash')!;
+    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.1-flash-lite', 'gemini-3.5-flash']);
+    const fbReq = fake!.requests.find((r) => r.stream && r.model === 'gemini-3.5-flash')!;
     expect(levelOf(fbReq)).toEqual({ includeThoughts: true, thinkingLevel: 'LOW' });
-    expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-3.6-flash');
+    expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-3.5-flash');
   });
 
-  it('everything 503 while 3.7 and 2.5 are listed: they are never called (only 3.5 and 3.6 are)', async () => {
+  it('everything 503 while 3.6, 3.7 and 2.5 are listed: they are never called (only 3.1-flash-lite and 3.5 are)', async () => {
     const base = await start((r) => (r.stream ? OVERLOADED : undefined));
     const events = await plan(base);
 
     expect(events.at(-1)!.data.code).toBe('AI_BUSY');
-    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.5-flash', 'gemini-3.6-flash']);
+    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.1-flash-lite', 'gemini-3.5-flash']);
     expect(streams()).not.toContain('gemini-3.7-flash');
+    expect(streams()).not.toContain('gemini-3.6-flash');
     expect(streams()).not.toContain('gemini-2.5-flash');
     expect(
       diag()
         .filter((d) => d.event === 'model_fallback')
         .map((d) => d.to),
-    ).toEqual(['gemini-3.5-flash', 'gemini-3.6-flash']);
+    ).toEqual(['gemini-3.1-flash-lite', 'gemini-3.5-flash']);
   });
 
   it('GEMINI_MODEL_FALLBACKS can still name an excluded model on purpose (the override wins)', async () => {
@@ -206,22 +211,24 @@ describe('503 fallback', () => {
     const events = await plan(base);
 
     expect(events.at(-1)?.event).toBe('result');
-    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash']); // a timeout is not retried on the same model
-    expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-3.5-flash');
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.1-flash-lite']); // a timeout is not retried on the same model
+    expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-3.1-flash-lite');
   });
 
   it('a retired / unknown alternative (404) is skipped, not shown as the error', async () => {
     const base = await start((r) =>
       r.stream && r.model === PRIMARY
         ? OVERLOADED
-        : r.stream && r.model === 'gemini-3.5-flash'
-          ? { error: { status: 404, code: 'NOT_FOUND', message: 'models/gemini-3.5-flash is not found' } }
+        : r.stream && r.model === 'gemini-3.1-flash-lite'
+          ? {
+              error: { status: 404, code: 'NOT_FOUND', message: 'models/gemini-3.1-flash-lite is not found' },
+            }
           : undefined,
     );
     const events = await plan(base);
 
     expect(events.at(-1)?.event).toBe('result');
-    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.5-flash', 'gemini-3.6-flash']);
+    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.1-flash-lite', 'gemini-3.5-flash']);
   });
 });
 
@@ -240,14 +247,14 @@ describe('an overloaded model list', () => {
     outage = true;
     const events = await plan(base);
     expect(events.at(-1)?.event).toBe('result');
-    expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-3.5-flash');
+    expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-3.1-flash-lite');
     expect(listCalls()).toBe(1); // the cached list was used: no second call into the failing endpoint
   });
 });
 
 describe('total failure', () => {
   it('every model 503: an honest AI_BUSY, one detail line per model, and never more than 4 upstream calls', async () => {
-    const base = await start(only(PRIMARY, 'gemini-3.5-flash', 'gemini-3.6-flash'));
+    const base = await start(only(PRIMARY, 'gemini-3.1-flash-lite', 'gemini-3.5-flash'));
     const events = await plan(base);
     const err = events.at(-1)!;
 
@@ -261,8 +268,8 @@ describe('total failure', () => {
     );
     expect(err.data.details.map((d: string) => d.split(':')[0])).toEqual([
       PRIMARY,
+      'gemini-3.1-flash-lite',
       'gemini-3.5-flash',
-      'gemini-3.6-flash',
     ]);
 
     expect(streams()).toHaveLength(4); // 2 on the primary + 1 + 1: the hard cap
@@ -273,12 +280,12 @@ describe('total failure', () => {
   it('the call cap holds even if many alternatives are configured (GEMINI_MODEL_FALLBACKS)', async () => {
     const base = await start((r) => (r.stream ? OVERLOADED : undefined), {
       GEMINI_MODEL_FALLBACKS:
-        'gemini-3.5-flash,gemini-3.6-flash,gemini-3.4-flash,gemini-3.3-flash,gemini-3.2-flash',
+        'gemini-3.1-flash-lite,gemini-3.5-flash,gemini-3.4-flash,gemini-3.3-flash,gemini-3.2-flash',
     });
     const events = await plan(base);
 
     expect(events.at(-1)!.data.code).toBe('AI_BUSY');
-    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.5-flash', 'gemini-3.6-flash']);
+    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.1-flash-lite', 'gemini-3.5-flash']);
     expect(listCalls()).toBe(0); // an explicit list needs no lookup
   });
 
@@ -337,37 +344,37 @@ const QUOTA: FakeReply = {
 const SCHEMA_400: FakeReply = { error: { status: 400, code: 'INVALID_ARGUMENT', message: TOO_MANY_STATES } };
 
 describe('response schema compatibility (the fake rejects state-heavy schemas, like Google)', () => {
-  it('primary over quota (429) → gemini-3.5-flash ACCEPTS the plan schema → a validated plan', async () => {
+  it('primary over quota (429) → gemini-3.1-flash-lite ACCEPTS the plan schema → a validated plan', async () => {
     const base = await start((r) => (r.stream && r.model === PRIMARY ? QUOTA : undefined));
     const events = await plan(base);
 
     expect(events.at(-1)?.event).toBe('result');
-    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash']);
-    const sent = fake!.requests.find((r) => r.stream && r.model === 'gemini-3.5-flash')!;
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.1-flash-lite']);
+    const sent = fake!.requests.find((r) => r.stream && r.model === 'gemini-3.1-flash-lite')!;
     expect(heavySchemaReason(sent.body?.generationConfig?.responseJsonSchema)).toBeNull();
-    expect(events.at(-1)!.data.runs.at(-1)).toMatchObject({ model: 'gemini-3.5-flash', ok: true });
+    expect(events.at(-1)!.data.runs.at(-1)).toMatchObject({ model: 'gemini-3.1-flash-lite', ok: true });
     // The plan really passed the server's own checks: dates from the allowed list, chronological, in capacity.
     expect(events.filter((e) => e.event === 'milestone').length).toBeGreaterThan(0);
   });
 
-  it('gemini-3.6-flash gets the SAME accepted schema when 3.5 is busy', async () => {
+  it('gemini-3.5-flash gets the SAME accepted schema when 3.1-flash-lite is busy', async () => {
     const base = await start((r) =>
       r.stream && r.model === PRIMARY
         ? QUOTA
-        : r.stream && r.model === 'gemini-3.5-flash'
+        : r.stream && r.model === 'gemini-3.1-flash-lite'
           ? OVERLOADED
           : undefined,
     );
     const events = await plan(base);
 
     expect(events.at(-1)?.event).toBe('result');
-    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash', 'gemini-3.6-flash']);
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.1-flash-lite', 'gemini-3.5-flash']);
     const schemaFor = (m: string) =>
       fake!.requests.find((r) => r.stream && r.model === m)!.body?.generationConfig?.responseJsonSchema;
-    expect(schemaFor('gemini-3.6-flash')).toEqual(schemaFor('gemini-3.5-flash'));
-    expect(schemaFor('gemini-3.6-flash')).toEqual(schemaFor(PRIMARY));
-    expect(heavySchemaReason(schemaFor('gemini-3.6-flash'))).toBeNull();
-    expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-3.6-flash');
+    expect(schemaFor('gemini-3.5-flash')).toEqual(schemaFor('gemini-3.1-flash-lite'));
+    expect(schemaFor('gemini-3.5-flash')).toEqual(schemaFor(PRIMARY));
+    expect(heavySchemaReason(schemaFor('gemini-3.5-flash'))).toBeNull();
+    expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-3.5-flash');
   });
 
   it('every plan request the app sends passes the fake schema check (no 400 anywhere in a normal run)', async () => {
@@ -381,11 +388,11 @@ describe('response schema compatibility (the fake rejects state-heavy schemas, l
 });
 
 describe('HTTP 400 schema rejection: accurate error, no model fallback', () => {
-  it('429 on the primary, then 400 "too many states" on 3.5: the 400 is reported, 3.6 is never called', async () => {
+  it('429 on the primary, then 400 "too many states" on 3.1-flash-lite: the 400 is reported, 3.5 is never called', async () => {
     const base = await start((r) =>
       r.stream && r.model === PRIMARY
         ? QUOTA
-        : r.stream && r.model === 'gemini-3.5-flash'
+        : r.stream && r.model === 'gemini-3.1-flash-lite'
           ? SCHEMA_400
           : undefined,
     );
@@ -400,12 +407,12 @@ describe('HTTP 400 schema rejection: accurate error, no model fallback', () => {
     );
     expect(err.data.message).not.toMatch(/busy/i);
     expect(err.data.details[0]).toMatch(
-      /^gemini-3\.5-flash: Gemini status 400 — Google said: INVALID_ARGUMENT: The specified schema/,
+      /^gemini-3\.1-flash-lite: Gemini status 400 — Google said: INVALID_ARGUMENT: The specified schema/,
     );
     expect(err.data.details[1]).toMatch(
       /^gemini-3\.8-flash \(tried first\): Gemini status 429 — Google said: RESOURCE_EXHAUSTED/,
     );
-    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash']); // no 3rd model, no retry of the 400 (nor of the quota 429)
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.1-flash-lite']); // no 3rd model, no retry of the 400 (nor of the quota 429)
     expect(diag().filter((d) => d.event === 'model_fallback')).toHaveLength(1);
     expect(diag().filter((d) => d.event === 'thinking_fallback')).toHaveLength(0); // not mistaken for a thinking problem
     expect(JSON.stringify(err) + logs.join('\n')).not.toContain(KEY);
@@ -438,7 +445,7 @@ describe('HTTP 400 schema rejection: accurate error, no model fallback', () => {
     };
     await expect(
       ai.models.generateContent({
-        model: 'gemini-3.5-flash',
+        model: 'gemini-3.1-flash-lite',
         contents: 'x',
         config: { responseMimeType: 'application/json', responseJsonSchema: old },
       }),
@@ -447,12 +454,12 @@ describe('HTTP 400 schema rejection: accurate error, no model fallback', () => {
 });
 
 describe('HTTP 429 quota exhausted: no same-model retry (other temporary errors keep theirs)', () => {
-  it('quota 429 on the primary: exactly ONE primary call, then straight to gemini-3.5-flash', async () => {
+  it('quota 429 on the primary: exactly ONE primary call, then straight to gemini-3.1-flash-lite', async () => {
     const base = await start((r) => (r.stream && r.model === PRIMARY ? QUOTA : undefined));
     const events = await plan(base);
 
     expect(events.at(-1)?.event).toBe('result');
-    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash']);
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.1-flash-lite']);
     const runs = events.at(-1)!.data.runs as { model: string; ok: boolean }[];
     expect(runs.filter((r) => r.model === PRIMARY)).toHaveLength(1);
     const fb = diag().find((d) => d.event === 'model_fallback')!;
@@ -462,7 +469,7 @@ describe('HTTP 429 quota exhausted: no same-model retry (other temporary errors 
   it('a 503 on the primary is still retried once before falling back', async () => {
     const base = await start(only(PRIMARY));
     await plan(base);
-    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.5-flash']);
+    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.1-flash-lite']);
   });
 
   it('a 429 that is NOT about quota is still retried once', async () => {
@@ -471,7 +478,7 @@ describe('HTTP 429 quota exhausted: no same-model retry (other temporary errors 
     };
     const base = await start((r) => (r.stream && r.model === PRIMARY ? busy429 : undefined));
     await plan(base);
-    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.5-flash']);
+    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.1-flash-lite']);
   });
 
   it('quota 429 everywhere: 3 calls in total (one per model), an honest AI_BUSY, within the 4-call cap', async () => {
@@ -479,11 +486,11 @@ describe('HTTP 429 quota exhausted: no same-model retry (other temporary errors 
     const err = (await plan(base)).at(-1)!;
 
     expect(err.data.code).toBe('AI_BUSY');
-    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash', 'gemini-3.6-flash']);
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.1-flash-lite', 'gemini-3.5-flash']);
     expect(err.data.details.map((d: string) => d.split(':')[0])).toEqual([
       PRIMARY,
+      'gemini-3.1-flash-lite',
       'gemini-3.5-flash',
-      'gemini-3.6-flash',
     ]);
   });
 });
@@ -520,7 +527,7 @@ describe('repair call', () => {
 
     expect(events.at(-1)?.event).toBe('result');
     const [repair] = repairs();
-    expect(repair!.model).toBe('gemini-3.5-flash'); // the model that wrote the plan
+    expect(repair!.model).toBe('gemini-3.1-flash-lite'); // the model that wrote the plan
     expect(repair!.body?.generationConfig?.thinkingConfig).toEqual({ thinkingLevel: 'LOW' });
     expect(repair!.body?.generationConfig?.responseJsonSchema).toBeTruthy();
   });
@@ -639,14 +646,14 @@ describe('stall after partial output → reset → next model', () => {
     const reset = events.findIndex((e) => e.event === 'reset');
 
     expect(events.at(-1)?.event).toBe('result');
-    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash']); // no same-model retry after output started
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.1-flash-lite']); // no same-model retry after output started
     // The abandoned attempt really had shown something (so the reset matters)…
     expect(events.slice(0, reset).some(isStale)).toBe(true);
     // …the reset names the switch, and is followed by the status, then the new model's events only.
-    expect(events[reset]!.data).toEqual({ reason: 'stalled', from: PRIMARY, to: 'gemini-3.5-flash' });
+    expect(events[reset]!.data).toEqual({ reason: 'stalled', from: PRIMARY, to: 'gemini-3.1-flash-lite' });
     expect(events[reset + 1]).toMatchObject({
       event: 'status',
-      data: { message: `${PRIMARY} stopped responding. Starting over with gemini-3.5-flash…` },
+      data: { message: `${PRIMARY} stopped responding. Starting over with gemini-3.1-flash-lite…` },
     });
     expect(events.slice(reset + 1).some(isStale)).toBe(false);
     expect(events.slice(reset + 1).some((e) => e.event === 'milestone')).toBe(true);
@@ -668,10 +675,10 @@ describe('stall after partial output → reset → next model', () => {
     expect(validating).toHaveLength(1); // validated once: the successful attempt only
     expect(result.runs.map((r: { model: string; ok: boolean }) => [r.model, r.ok])).toEqual([
       [PRIMARY, false],
-      ['gemini-3.5-flash', true],
+      ['gemini-3.1-flash-lite', true],
     ]);
     const fb = diag().find((d) => d.event === 'model_fallback')!;
-    expect(fb).toMatchObject({ from: PRIMARY, to: 'gemini-3.5-flash', stalled: true });
+    expect(fb).toMatchObject({ from: PRIMARY, to: 'gemini-3.1-flash-lite', stalled: true });
     expect(fb.reason).toMatch(
       /Stream paused for more than 0 s \| phase: streaming \(no new chunk after 2 chunks: 0 thinking, 2 text\)/,
     );
@@ -688,12 +695,12 @@ describe('stall after partial output → reset → next model', () => {
     expect(events.find((e) => e.event === 'reset')?.data.reason).toBe('stalled');
   });
 
-  it('quota 429 on the primary, then 3.5 stalls mid-answer: 3.6 writes the plan (3 calls, two resets in order)', async () => {
+  it('quota 429 on the primary, then 3.1-flash-lite stalls mid-answer: 3.5 writes the plan (3 calls, two resets in order)', async () => {
     const base = await start(
       (r) =>
         r.stream && r.model === PRIMARY
           ? QUOTA
-          : r.stream && r.model === 'gemini-3.5-flash'
+          : r.stream && r.model === 'gemini-3.1-flash-lite'
             ? staleThenStall(r)
             : undefined,
       {},
@@ -702,14 +709,14 @@ describe('stall after partial output → reset → next model', () => {
     const events = await plan(base);
 
     expect(events.at(-1)?.event).toBe('result');
-    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash', 'gemini-3.6-flash']);
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.1-flash-lite', 'gemini-3.5-flash']);
     expect(events.filter((e) => e.event === 'reset').map((e) => [e.data.reason, e.data.to])).toEqual([
-      ['unavailable', 'gemini-3.5-flash'],
-      ['stalled', 'gemini-3.6-flash'],
+      ['unavailable', 'gemini-3.1-flash-lite'],
+      ['stalled', 'gemini-3.5-flash'],
     ]);
     const lastReset = events.map((e) => e.event).lastIndexOf('reset');
     expect(events.slice(lastReset).some(isStale)).toBe(false);
-    expect(events.at(-1)!.data.runs.at(-1)).toMatchObject({ model: 'gemini-3.6-flash', ok: true });
+    expect(events.at(-1)!.data.runs.at(-1)).toMatchObject({ model: 'gemini-3.5-flash', ok: true });
   });
 
   it('every model stalls: an honest error, never more than the 4-call cap', async () => {
@@ -718,7 +725,7 @@ describe('stall after partial output → reset → next model', () => {
 
     expect(err.event).toBe('error');
     expect(err.data.code).toBe('AI_BUSY');
-    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash', 'gemini-3.6-flash']);
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.1-flash-lite', 'gemini-3.5-flash']);
     expect(streams().length).toBeLessThanOrEqual(4);
   });
 
@@ -737,7 +744,7 @@ describe('stall after partial output → reset → next model', () => {
     }
   });
 
-  it('after a 429 on the primary, a 400 on 3.5 stops the chain: no reset towards 3.6', async () => {
+  it('after a 429 on the primary, a 400 on 3.1-flash-lite stops the chain: no reset towards 3.5', async () => {
     const base = await start(
       (r) => (r.stream && r.model === PRIMARY ? QUOTA : r.stream ? SCHEMA_400 : undefined),
       {},
@@ -745,8 +752,10 @@ describe('stall after partial output → reset → next model', () => {
     );
     const events = await plan(base);
     expect(events.at(-1)?.data.code).toBe('INTERNAL');
-    expect(events.filter((e) => e.event === 'reset').map((e) => e.data.to)).toEqual(['gemini-3.5-flash']);
-    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash']);
+    expect(events.filter((e) => e.event === 'reset').map((e) => e.data.to)).toEqual([
+      'gemini-3.1-flash-lite',
+    ]);
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.1-flash-lite']);
   });
 
   it('a stall when too little of the plan time limit is left: no next model, no reset', async () => {
@@ -799,11 +808,11 @@ describe('a cut-off answer is never used', () => {
     const events = await plan(base);
 
     expect(events.at(-1)?.event).toBe('result');
-    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash']);
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.1-flash-lite']);
     expect(events.find((e) => e.event === 'reset')?.data).toEqual({
       reason: 'incomplete',
       from: PRIMARY,
-      to: 'gemini-3.5-flash',
+      to: 'gemini-3.1-flash-lite',
     });
     expect(
       events.find(
@@ -888,14 +897,14 @@ describe("Google's continuation protocol (SDK automatic continuation)", () => {
 
     expect(events.at(-1)?.event).toBe('result');
     expect(events.find((e) => e.event === 'reset')?.data.reason).toBe('stalled');
-    expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-3.5-flash');
+    expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-3.1-flash-lite');
   });
 });
 
 describe('default primary model (GEMINI_MODEL not set)', () => {
-  const LISTED = [...KEY_MODELS, 'gemini-3.1-flash-lite'];
+  const LISTED = [...KEY_MODELS, 'gemini-3.5-flash-lite'];
 
-  it('the plan is written by gemini-3.1-flash-lite when the key lists it: one call, no fallback', async () => {
+  it('the plan is written by gemini-3.5-flash-lite when the key lists it: one call, no fallback', async () => {
     fake = await startFakeGemini(() => undefined, { models: LISTED });
     const app = createApp({
       now: () => NOW,
@@ -913,15 +922,47 @@ describe('default primary model (GEMINI_MODEL not set)', () => {
     const events = await plan(`http://127.0.0.1:${(server.address() as AddressInfo).port}`);
 
     expect(events.at(-1)?.event).toBe('result');
-    expect(streams()).toEqual(['gemini-3.1-flash-lite']);
-    expect(events.at(-1)!.data.runs.at(-1)).toMatchObject({ model: 'gemini-3.1-flash-lite', ok: true });
+    expect(streams()).toEqual(['gemini-3.5-flash-lite']);
+    expect(events.at(-1)!.data.runs.at(-1)).toMatchObject({ model: 'gemini-3.5-flash-lite', ok: true });
     const sent = fake.requests.find((r) => r.stream)!;
     expect(levelOf(sent)).toEqual({ includeThoughts: true, thinkingLevel: 'LOW' }); // same settings as before
   });
 
-  it('the existing fallback logic is kept: default busy → gemini-3.5-flash', async () => {
+  it('the whole default chain: 3.5-flash-lite (+1 retry) → 3.1-flash-lite → 3.5-flash; 3.6 and 3.7 are never called', async () => {
+    fake = await startFakeGemini((r) => (r.stream ? OVERLOADED : undefined), { models: LISTED });
+    const app = createApp({
+      now: () => NOW,
+      env: { GEMINI_API_KEY: KEY, ALLOWED_ORIGINS: '' },
+      gemini: new GoogleGenAI({ apiKey: KEY, httpOptions: { baseUrl: fake.baseUrl } }) as never,
+      tuning: {
+        firstChunkTimeoutMs: 300,
+        retryBaseMs: 1,
+        retryMaxMs: 2,
+        rateLimit: { windowMax: 1000, dayMax: 10000, windowSec: 600 },
+      },
+    });
+    server = app.listen(0, '127.0.0.1');
+    await new Promise((r) => server!.once('listening', r));
+    const err = (await plan(`http://127.0.0.1:${(server.address() as AddressInfo).port}`)).at(-1)!;
+
+    expect(LISTED).toEqual(expect.arrayContaining(['gemini-3.6-flash', 'gemini-3.7-flash'])); // offered by the key…
+    expect(streams()).toEqual([
+      'gemini-3.5-flash-lite',
+      'gemini-3.5-flash-lite',
+      'gemini-3.1-flash-lite',
+      'gemini-3.5-flash',
+    ]); // …but never used; 4 calls = the cap
+    expect(err.data.code).toBe('AI_BUSY');
+    expect(err.data.details.map((d: string) => d.split(':')[0])).toEqual([
+      'gemini-3.5-flash-lite',
+      'gemini-3.1-flash-lite',
+      'gemini-3.5-flash',
+    ]);
+  });
+
+  it('default busy → gemini-3.1-flash-lite (the existing fallback logic, new order)', async () => {
     fake = await startFakeGemini(
-      (r) => (r.stream && r.model === 'gemini-3.1-flash-lite' ? OVERLOADED : undefined),
+      (r) => (r.stream && r.model === 'gemini-3.5-flash-lite' ? OVERLOADED : undefined),
       {
         models: LISTED,
       },
@@ -942,10 +983,10 @@ describe('default primary model (GEMINI_MODEL not set)', () => {
     const events = await plan(`http://127.0.0.1:${(server.address() as AddressInfo).port}`);
 
     expect(events.at(-1)?.event).toBe('result');
-    expect(streams()).toEqual(['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.5-flash']);
+    expect(streams()).toEqual(['gemini-3.5-flash-lite', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite']);
     expect(events.find((e) => e.event === 'reset')?.data).toMatchObject({
-      from: 'gemini-3.1-flash-lite',
-      to: 'gemini-3.5-flash',
+      from: 'gemini-3.5-flash-lite',
+      to: 'gemini-3.1-flash-lite',
     });
   });
 });

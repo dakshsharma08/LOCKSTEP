@@ -44,12 +44,13 @@ export function createGeminiClient(
 export const FALLBACK_MODEL = 'gemini-flash-latest';
 
 /**
- * The default model for this submission: on the developer's key (2026-11-23) it wrote a valid plan and
- * the whole /api/plan flow passed in 7.3 s with 7/7 code checks, while the larger Flash models' free-tier
- * quotas were used up. GEMINI_MODEL overrides it; if a key does not list it, the newest stable Flash
- * model is used as before.
+ * The default model for this submission. Real check on the developer's key (2026-11-23, the app's own
+ * prompt, schema and validator): gemini-3.5-flash-lite wrote a valid plan in 3.4 s (finishReason STOP,
+ * JSON and schema valid, 7/7 code checks, 4 milestones / 12 tasks), while gemini-3.7-flash timed out and
+ * the larger Flash models were overloaded or out of free-tier quota. GEMINI_MODEL overrides it; if a key
+ * does not list it, the newest stable Flash model is used as before.
  */
-export const DEFAULT_PRIMARY_MODEL = 'gemini-3.1-flash-lite';
+export const DEFAULT_PRIMARY_MODEL = 'gemini-3.5-flash-lite';
 
 /**
  * The model to use when GEMINI_MODEL is not set.

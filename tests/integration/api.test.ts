@@ -423,11 +423,16 @@ describe('GET /api/health', () => {
     expect(listCalls).toBe(1);
   });
 
-  it('uses the default model gemini-3.1-flash-lite when the key lists it', async () => {
+  it('uses the default model gemini-3.5-flash-lite when the key lists it', async () => {
     mock.use(
       http.get(LIST_URL, () =>
         HttpResponse.json({
-          models: ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.1-flash-lite'].map((n) => ({
+          models: [
+            'gemini-3.8-flash',
+            'gemini-3.5-flash',
+            'gemini-3.5-flash-lite',
+            'gemini-3.1-flash-lite',
+          ].map((n) => ({
             name: `models/${n}`,
             supportedGenerationMethods: ['generateContent'],
           })),
@@ -436,7 +441,7 @@ describe('GET /api/health', () => {
     );
     const base = await start({ env: { GEMINI_API_KEY: TEST_KEY } });
     const body = (await (await fetch(`${base}/api/health`)).json()) as HealthResponse;
-    expect(body.ai.model).toBe('gemini-3.1-flash-lite');
+    expect(body.ai.model).toBe('gemini-3.5-flash-lite');
   });
 
   it('GEMINI_MODEL still overrides the default model', async () => {
@@ -451,7 +456,7 @@ describe('GET /api/health', () => {
     );
     const base = await start({ env: { GEMINI_API_KEY: TEST_KEY } });
     const body = (await (await fetch(`${base}/api/health`)).json()) as HealthResponse;
-    expect(body.ai.model).toBe('gemini-3.1-flash-lite');
+    expect(body.ai.model).toBe('gemini-3.5-flash-lite');
   });
 
   it('answers unknown /api routes with a JSON 404', async () => {

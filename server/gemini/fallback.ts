@@ -11,8 +11,8 @@
  *   • Only TEMPORARY failures on the primary trigger a fallback. A 400 (bad request), 401/403 (key) or
  *     404 (model missing) would fail on every model, so we show it instead of hiding it.
  *   • The alternatives come from the models YOUR key can actually call (models.list): a preferred order
- *     (gemini-3.5-flash, then gemini-3.6-flash) is applied only to models the key lists, so a retired model
- *     drops out by itself. GEMINI_MODEL_FALLBACKS overrides it.
+ *     (gemini-3.1-flash-lite, then gemini-3.5-flash) is applied only to models the key lists, so a retired
+ *     model drops out by itself. GEMINI_MODEL_FALLBACKS overrides it.
  *   • Hard cap on upstream calls per plan: 1 + primaryRetries + fallbacks (default 4 calls in total).
  *     503s also count against rate limits, so hammering a struggling API makes things worse.
  *   • A model that STALLS mid-answer (no chunk within the limit, or its own stream time used up), or whose
@@ -67,19 +67,26 @@ function parseCandidate(raw: string): Candidate | null {
 }
 
 /**
- * The default fallback order, from REAL diagnostics on the developer's key (2026-11-23):
- *   • with the primary `gemini-3.8-flash` answering 503 / later 429 (free-tier quota):
- *       gemini-3.7-flash 503 / timeout; gemini-2.5-flash 404 (not available to new users);
- *   • with the full plan request (prompt + response schema, commit ba2deac):
- *       gemini-3.5-flash  valid plan JSON in ~78 s;
- *       gemini-3.6-flash  answers small requests, but the plan stream stalled after 13 chunks.
- * So 3.5 is tried first, then 3.6. A preferred model is only used if the key's own model list contains
- * it, so a model Google retires later drops out by itself. GEMINI_MODEL_FALLBACKS overrides all of this.
+ * The default fallback order after the primary (gemini-3.5-flash-lite), from REAL runs on the developer's
+ * key (2026-11-23). Only models that have produced a valid LOCKSTEP plan:
+ *   gemini-3.1-flash-lite  valid plan, whole /api/plan flow 7.3 s, 7/7 checks (fast: tried first);
+ *   gemini-3.5-flash       valid plans in ~55–78 s (slow but proven: tried second).
+ * A preferred model is only used if the key's own model list contains it, so a model Google retires later
+ * drops out by itself. GEMINI_MODEL_FALLBACKS overrides all of this.
  */
-export const PREFERRED_FALLBACKS: readonly string[] = ['gemini-3.5-flash', 'gemini-3.6-flash'];
+export const PREFERRED_FALLBACKS: readonly string[] = ['gemini-3.1-flash-lite', 'gemini-3.5-flash'];
 
-/** Never part of the AUTOMATIC chain for now (see above). Still usable via GEMINI_MODEL_FALLBACKS. */
-export const EXCLUDED_FALLBACKS: readonly string[] = ['gemini-3.7-flash', 'gemini-2.5-flash'];
+/**
+ * Never part of the AUTOMATIC chain (still usable on purpose via GEMINI_MODEL / GEMINI_MODEL_FALLBACKS):
+ *   gemini-3.7-flash  503s; a 30 s timeout on a minimal request and a 120 s timeout on the plan request;
+ *   gemini-3.6-flash  the plan stream stalled after 13 chunks; 503s; never produced a valid plan;
+ *   gemini-2.5-flash  404, not available to new users.
+ */
+export const EXCLUDED_FALLBACKS: readonly string[] = [
+  'gemini-3.7-flash',
+  'gemini-3.6-flash',
+  'gemini-2.5-flash',
+];
 
 /**
  * Choose up to `max` alternatives from the key's model list.

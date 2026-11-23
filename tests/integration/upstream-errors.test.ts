@@ -14,7 +14,7 @@ import { startFakeGemini, type FakeGemini, type FakeReply, type FakeRequest } fr
 
 // Built at runtime: a key-shaped literal in source could trip GitHub secret scanning.
 const KEY = `${['AI', 'za'].join('')}SyFAKE-upstream-key-0123456789abcdefg`;
-const MODEL = 'gemini-3.1-flash-lite';
+const MODEL = 'gemini-3.5-flash-lite'; // the default primary
 const GOAL = 'Pass the AWS Cloud Practitioner exam for my secret promotion';
 const CONSTRAINTS = 'Only evenings, my manager Dana must not know';
 
@@ -33,7 +33,9 @@ afterEach(async () => {
 });
 
 async function planWith(decide: (r: FakeRequest) => FakeReply | void, tuning: Record<string, unknown> = {}) {
-  fake = await startFakeGemini(decide, { models: [MODEL, 'gemini-3.5-flash', 'gemini-3.6-flash'] });
+  fake = await startFakeGemini(decide, {
+    models: [MODEL, 'gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-3.7-flash'],
+  });
   const app = createApp({
     now: () => new Date('2026-11-23T12:00:00Z'),
     env: { GEMINI_API_KEY: KEY, ALLOWED_ORIGINS: '' },
@@ -212,7 +214,7 @@ describe('other failures', () => {
         appCode: 'AI_BUSY',
       }),
     ]);
-    expect(lines('api_result')[0]).toMatchObject({ outcome: 'ok', model: 'gemini-3.5-flash' });
+    expect(lines('api_result')[0]).toMatchObject({ outcome: 'ok', model: 'gemini-3.1-flash-lite' });
   });
 
   it('a stream that stalls (our own timeout): stage, chunk counts and the cause, no Google fields', async () => {

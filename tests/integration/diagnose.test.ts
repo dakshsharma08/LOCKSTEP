@@ -129,12 +129,13 @@ describe('diagnose: overloaded primary (HTTP 503) and the fallback chain', () =>
     expect(text).not.toContain(KEY);
   });
 
-  it("with the developer's real model list the chain is 3.8 → 3.5 → 3.6, and 3.7 / 2.5 are never tried", async () => {
+  it("with the developer's real model list the chain is 3.8 → 3.1-flash-lite → 3.5, and 3.6 / 3.7 / 2.5 are never tried", async () => {
     const REAL = [
       'gemini-3.8-flash',
       'gemini-3.7-flash',
-      'gemini-3.5-flash',
       'gemini-3.6-flash',
+      'gemini-3.1-flash-lite',
+      'gemini-3.5-flash',
       'gemini-2.5-flash',
     ];
     const { report, text } = await diagnose(
@@ -143,9 +144,10 @@ describe('diagnose: overloaded primary (HTTP 503) and the fallback chain', () =>
       REAL,
     );
 
-    expect(report.alternatives.map((a) => a.model)).toEqual(['gemini-3.5-flash', 'gemini-3.6-flash']);
-    expect(text).toMatch(/Fallback chain: gemini-3\.8-flash → gemini-3\.5-flash → gemini-3\.6-flash/);
+    expect(report.alternatives.map((a) => a.model)).toEqual(['gemini-3.1-flash-lite', 'gemini-3.5-flash']);
+    expect(text).toMatch(/Fallback chain: gemini-3\.8-flash → gemini-3\.1-flash-lite → gemini-3\.5-flash/);
     expect(text).not.toMatch(/gemini-3\.7-flash +(OK|FAIL)/);
+    expect(text).not.toMatch(/gemini-3\.6-flash +(OK|FAIL)/);
     expect(text).not.toMatch(/gemini-2\.5-flash +(OK|FAIL)/);
   });
 
@@ -187,8 +189,9 @@ describe("diagnose: the owner's real case (primary over quota, plan schema on th
   const REAL = [
     'gemini-3.8-flash',
     'gemini-3.7-flash',
-    'gemini-3.5-flash',
     'gemini-3.6-flash',
+    'gemini-3.1-flash-lite',
+    'gemini-3.5-flash',
     'gemini-2.5-flash',
   ];
   const quota = {
@@ -199,7 +202,7 @@ describe("diagnose: the owner's real case (primary over quota, plan schema on th
     },
   };
 
-  it('primary 429: says QUOTA, spends no more calls on it, and checks the real plan schema on 3.5 and 3.6', async () => {
+  it('primary 429: says QUOTA, spends no more calls on it, and checks the real plan schema on 3.1-flash-lite and 3.5', async () => {
     const { report, text } = await diagnose((r) => (r.model === 'gemini-3.8-flash' ? quota : {}), {}, REAL);
     const v = report.verdict.join('\n');
 
@@ -208,15 +211,15 @@ describe("diagnose: the owner's real case (primary over quota, plan schema on th
     expect(report.plan).toHaveLength(1); // the other thinking variants were skipped: they would only burn quota
     expect(text).toMatch(/other thinking settings skipped: gemini-3\.8-flash answered HTTP 429/);
     expect(report.planAlternatives.map((p) => [p.model, p.timing.ok, p.timing.jsonOk])).toEqual([
+      ['gemini-3.1-flash-lite', true, true],
       ['gemini-3.5-flash', true, true],
-      ['gemini-3.6-flash', true, true],
     ]);
+    expect(v).toMatch(/PLAN SCHEMA OK on gemini-3\.1-flash-lite/);
     expect(v).toMatch(/PLAN SCHEMA OK on gemini-3\.5-flash/);
-    expect(v).toMatch(/PLAN SCHEMA OK on gemini-3\.6-flash/);
     expect(v).not.toMatch(/SCHEMA TOO COMPLEX/);
-    expect(report.flow).toMatchObject({ ok: true, fellBack: true, model: 'gemini-3.5-flash' });
+    expect(report.flow).toMatchObject({ ok: true, fellBack: true, model: 'gemini-3.1-flash-lite' });
     // The plan request each alternative got is the app's real one: prompt + response schema.
-    const sent = fake!.requests.filter((r) => planStream(r) && r.model === 'gemini-3.6-flash');
+    const sent = fake!.requests.filter((r) => planStream(r) && r.model === 'gemini-3.5-flash');
     expect(sent.length).toBeGreaterThan(0);
     expect(sent[0]!.body?.systemInstruction).toBeTruthy();
     expect(text).not.toContain(KEY);
@@ -236,7 +239,7 @@ describe("diagnose: the owner's real case (primary over quota, plan schema on th
     const v = report.verdict.join('\n');
 
     expect(v).toMatch(
-      /SCHEMA TOO COMPLEX: Google rejected the plan's response schema \(HTTP 400\) on gemini-3\.5-flash, gemini-3\.6-flash/,
+      /SCHEMA TOO COMPLEX: Google rejected the plan's response schema \(HTTP 400\) on gemini-3\.1-flash-lite, gemini-3\.5-flash/,
     );
     expect(v).toMatch(/another model will not help/);
     expect(report.flow?.ok).toBe(false);
@@ -252,6 +255,7 @@ describe('diagnose: uses the same settings as the app, and shows how a stream st
     'gemini-3.7-flash',
     'gemini-3.6-flash',
     'gemini-3.5-flash',
+    'gemini-3.1-flash-lite',
     'gemini-2.5-flash',
   ];
   const quota = {
@@ -263,17 +267,17 @@ describe('diagnose: uses the same settings as the app, and shows how a stream st
   it('GEMINI_MODEL_FALLBACKS reaches EVERY step, including the full /api/plan flow', async () => {
     const { report, text } = await diagnose(
       primaryOverQuota,
-      { env: { GEMINI_MODEL_FALLBACKS: 'gemini-3.6-flash' } },
+      { env: { GEMINI_MODEL_FALLBACKS: 'gemini-3.5-flash' } },
       REAL,
     );
 
     expect(report.chainSource).toBe('GEMINI_MODEL_FALLBACKS');
     expect(text).toMatch(
-      /Fallback chain: gemini-3\.8-flash → gemini-3\.6-flash +\(from GEMINI_MODEL_FALLBACKS\)/,
+      /Fallback chain: gemini-3\.8-flash → gemini-3\.5-flash +\(from GEMINI_MODEL_FALLBACKS\)/,
     );
     // Before the fix the flow ignored the variable and used the automatic chain (3.5 first).
-    expect(report.flow).toMatchObject({ ok: true, fellBack: true, model: 'gemini-3.6-flash' });
-    expect(planStreamTo('gemini-3.5-flash')).toHaveLength(0);
+    expect(report.flow).toMatchObject({ ok: true, fellBack: true, model: 'gemini-3.5-flash' });
+    expect(planStreamTo('gemini-3.1-flash-lite')).toHaveLength(0);
   });
 
   it('GEMINI_MODEL_FALLBACKS=none reaches the flow too: no alternative is tried', async () => {
@@ -305,19 +309,19 @@ describe('diagnose: uses the same settings as the app, and shows how a stream st
       (r) =>
         r.model === 'gemini-3.8-flash'
           ? quota
-          : planStream(r) && r.model === 'gemini-3.6-flash'
+          : planStream(r) && r.model === 'gemini-3.5-flash'
             ? { stallAfterChunks: 2 }
             : undefined,
       { planTimeoutMs: 600 },
       REAL,
     );
 
-    const t = report.planAlternatives.find((p) => p.model === 'gemini-3.6-flash')!.timing;
+    const t = report.planAlternatives.find((p) => p.model === 'gemini-3.5-flash')!.timing;
     expect(t).toMatchObject({ ok: false, timedOut: true, stalledIn: 'streaming', chunks: 2, textChunks: 2 });
     expect(t.lastChunkMs).toBeLessThan(t.totalMs);
-    expect(text).toMatch(/gemini-3\.6-flash +FAIL STALLED after 2 chunks — 2 chunks \(0 thinking, 2 text\)/);
+    expect(text).toMatch(/gemini-3\.5-flash +FAIL STALLED after 2 chunks — 2 chunks \(0 thinking, 2 text\)/);
     expect(report.verdict.join('\n')).toMatch(
-      /STREAM STALL on gemini-3\.6-flash: 2 chunks \(0 thinking, 2 text\), then nothing for [\d.]+ (ms|s)/,
+      /STREAM STALL on gemini-3\.5-flash: 2 chunks \(0 thinking, 2 text\), then nothing for [\d.]+ (ms|s)/,
     );
   });
 
@@ -326,16 +330,16 @@ describe('diagnose: uses the same settings as the app, and shows how a stream st
       (r) =>
         r.model === 'gemini-3.8-flash'
           ? quota
-          : planStream(r) && r.model === 'gemini-3.6-flash'
+          : planStream(r) && r.model === 'gemini-3.5-flash'
             ? { thoughtAfterMs: 10, stallAfterChunks: 0 }
             : undefined,
       { planTimeoutMs: 600 },
       REAL,
     );
 
-    const t = report.planAlternatives.find((p) => p.model === 'gemini-3.6-flash')!.timing;
+    const t = report.planAlternatives.find((p) => p.model === 'gemini-3.5-flash')!.timing;
     expect(t).toMatchObject({ chunks: 1, thoughtChunks: 1, textChunks: 0, stalledIn: 'streaming' });
-    expect(report.verdict.join('\n')).toMatch(/THINKING STALL on gemini-3\.6-flash: 1 chunks, all thinking/);
+    expect(report.verdict.join('\n')).toMatch(/THINKING STALL on gemini-3\.5-flash: 1 chunks, all thinking/);
     expect(report.verdict.join('\n')).toMatch(/GEMINI_THINKING_LEVEL=minimal/);
   });
 
@@ -344,24 +348,26 @@ describe('diagnose: uses the same settings as the app, and shows how a stream st
       (r) =>
         r.model === 'gemini-3.8-flash'
           ? quota
-          : planStream(r) && r.model === 'gemini-3.5-flash'
+          : planStream(r) && r.model === 'gemini-3.1-flash-lite'
             ? { pauseAfterChunk: 2, pauseMs: 250 }
             : undefined,
       { chunkIdleTimeoutMs: 100, skipFlow: true },
       REAL,
     );
 
-    const t = report.planAlternatives.find((p) => p.model === 'gemini-3.5-flash')!.timing;
+    const t = report.planAlternatives.find((p) => p.model === 'gemini-3.1-flash-lite')!.timing;
     expect(t.ok).toBe(true);
     expect(t.maxGapMs).toBeGreaterThanOrEqual(200);
     expect(t.maxGapAfterChunk).toBe(2);
     expect(text).toMatch(/longest gap [\d.]+ (ms|s) after chunk 2/);
-    expect(report.verdict.join('\n')).toMatch(/LONG PAUSE on gemini-3\.5-flash: it finished, but paused/);
+    expect(report.verdict.join('\n')).toMatch(
+      /LONG PAUSE on gemini-3\.1-flash-lite: it finished, but paused/,
+    );
   });
 });
 
 describe('diagnose: what the SDK hides (wire probe), cut-off answers and speed', () => {
-  const REAL = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash'];
+  const REAL = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.1-flash-lite'];
   const quota = {
     error: { status: 429, code: 'RESOURCE_EXHAUSTED', message: 'You exceeded your current quota. limit: 20' },
   };
@@ -372,69 +378,73 @@ describe('diagnose: what the SDK hides (wire probe), cut-off answers and speed',
 
   it('a normal plan request: finish STOP, token counts, speed, and what came over the wire', async () => {
     const { report, text } = await diagnose(onAlt('none', {}), { skipFlow: true }, REAL);
-    const t = altTiming(report, 'gemini-3.5-flash');
+    const t = altTiming(report, 'gemini-3.1-flash-lite');
 
     expect(t).toMatchObject({ ok: true, finishReason: 'STOP', outputTokens: 20, promptTokens: 10 });
     expect(t.wire).toMatchObject({ requests: 1, commentLines: 0 });
     expect(t.wire!.bytes).toBeGreaterThan(500);
     expect(text).toMatch(
-      /plan request on gemini-3\.5-flash +OK .*finish STOP · 20 output tokens.*wire: 1 request\(s\)/,
+      /plan request on gemini-3\.1-flash-lite +OK .*finish STOP · 20 output tokens.*wire: 1 request\(s\)/,
     );
-    expect(report.verdict.join('\n')).toMatch(/SPEED on gemini-3\.5-flash: first text at/);
+    expect(report.verdict.join('\n')).toMatch(/SPEED on gemini-3\.1-flash-lite: first text at/);
   });
 
   it('an answer that ends without STOP: CUT OFF', async () => {
     const { report } = await diagnose(
-      onAlt('gemini-3.5-flash', { noFinish: true }),
+      onAlt('gemini-3.1-flash-lite', { noFinish: true }),
       { skipFlow: true },
       REAL,
     );
-    expect(altTiming(report, 'gemini-3.5-flash').finishReason).toBeUndefined();
+    expect(altTiming(report, 'gemini-3.1-flash-lite').finishReason).toBeUndefined();
     expect(report.verdict.join('\n')).toMatch(
-      /CUT OFF on gemini-3\.5-flash: the answer ended without a finish reason/,
+      /CUT OFF on gemini-3\.1-flash-lite: the answer ended without a finish reason/,
     );
   });
 
   it('Google splits the answer: CONTINUATION, with the extra request counted', async () => {
     const { report } = await diagnose(
-      onAlt('gemini-3.5-flash', { continueAfterChunks: 2, resumeDelayMs: 50 }),
+      onAlt('gemini-3.1-flash-lite', { continueAfterChunks: 2, resumeDelayMs: 50 }),
       { skipFlow: true },
       REAL,
     );
-    const t = altTiming(report, 'gemini-3.5-flash');
+    const t = altTiming(report, 'gemini-3.1-flash-lite');
     expect(t).toMatchObject({ ok: true, hops: 1, finishReason: 'STOP' });
     expect(t.wire?.requests).toBe(2);
     expect(report.verdict.join('\n')).toMatch(
-      /CONTINUATION on gemini-3\.5-flash: Google split the answer into 2 requests/,
+      /CONTINUATION on gemini-3\.1-flash-lite: Google split the answer into 2 requests/,
     );
   });
 
   it('a "stall" during which the connection kept sending SSE comments: KEEP-ALIVES, a live connection', async () => {
     const { report } = await diagnose(
-      onAlt('gemini-3.6-flash', { stallAfterChunks: 2, keepAliveMs: 80 }),
+      onAlt('gemini-3.5-flash', { stallAfterChunks: 2, keepAliveMs: 80 }),
       { skipFlow: true, planTimeoutMs: 1500 },
       REAL,
     );
-    const t = altTiming(report, 'gemini-3.6-flash');
+    const t = altTiming(report, 'gemini-3.5-flash');
     expect(t).toMatchObject({ ok: false, stalledIn: 'streaming', chunks: 2 });
     expect(t.wire!.commentLines).toBeGreaterThan(5);
     expect(t.wire!.lastByteMs!).toBeGreaterThan(t.lastChunkMs! + 1000);
     expect(report.verdict.join('\n')).toMatch(
-      /KEEP-ALIVES on gemini-3\.6-flash: \d+ SSE comment line\(s\) arrived that the SDK hides; the connection was still sending/,
+      /KEEP-ALIVES on gemini-3\.5-flash: \d+ SSE comment line\(s\) arrived that the SDK hides; the connection was still sending/,
     );
   });
 });
 
 describe('diagnose: chooses the model the same way as the app', () => {
-  it('no --model and no GEMINI_MODEL: the default gemini-3.1-flash-lite, because this key lists it', async () => {
+  it('no --model and no GEMINI_MODEL: the default gemini-3.5-flash-lite, because this key lists it', async () => {
     const { report, text } = await diagnose(() => undefined, { model: undefined, env: {}, skipPlan: true }, [
       'gemini-3.8-flash',
       'gemini-3.5-flash',
+      'gemini-3.5-flash-lite',
       'gemini-3.1-flash-lite',
     ]);
-    expect(report).toMatchObject({ model: 'gemini-3.1-flash-lite', modelSource: 'default' });
+    expect(report).toMatchObject({ model: 'gemini-3.5-flash-lite', modelSource: 'default' });
     expect(text).toMatch(
-      /Model under test: gemini-3\.1-flash-lite \(this app's default model, listed for this key\)/,
+      /Model under test: gemini-3\.5-flash-lite \(this app's default model, listed for this key\)/,
+    );
+    expect(text).toMatch(
+      /Fallback chain: gemini-3\.5-flash-lite → gemini-3\.1-flash-lite → gemini-3\.5-flash/,
     );
   });
 
