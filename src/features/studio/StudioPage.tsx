@@ -26,6 +26,7 @@ import { ExportPanel } from './ExportPanel';
 import { ExportDialog } from './ExportDialog';
 import { buildSnapshot } from './living';
 import { thumbnailFrom } from './canvas';
+import { useFitPhone } from './useFitPhone';
 
 type Tab = 'template' | 'text' | 'color' | 'background' | 'layout' | 'export';
 const MOBILE_TABS: { id: Tab; label: string }[] = [
@@ -126,42 +127,20 @@ export default function StudioPage() {
   const [sheetOpen, setSheetOpen] = useState(false);
   const swipe = useRef<{ y: number; swiped: boolean } | null>(null);
   const desktop = useMedia('(min-width: 1024px)');
-  const previewBox = useRef<HTMLDivElement>(null);
-  const [previewW, setPreviewW] = useState(300);
 
   const wpDataMemo = useMemo(
     () => (data && m ? buildWallpaperData(data, m, motivation.line, Math.max(refreshAt, Date.now())) : null),
     [data, m, motivation.line, refreshAt],
   );
 
-  // Fit the phone into the available space.
   const wpData = wpDataMemo;
-  const hasPreview = !!design && !!wpData;
-  useEffect(() => {
-    const el = previewBox.current;
-    if (!el || !design) return;
-    const ro = new ResizeObserver(() => {
-      const r = el.getBoundingClientRect();
-      const dev = getDevice(design.device, design.custom);
-      const aspect = dev.height / dev.width;
-      if (desktop) {
-        const byH = (r.height - 24) / aspect;
-        setPreviewW(Math.floor(Math.max(180, Math.min(400, r.width - 24, byH))));
-        return;
-      }
-      // Fit the whole phone FRAME (the screen plus PhonePreview's 8px bezel on every side) into the box,
-      // with a little air. No minimum: on a short screen the phone gets smaller; it never spills over the
-      // title or the editor.
-      const FRAME = 16;
-      const AIR = 12;
-      const w = Math.min(340, r.width - FRAME - AIR, (r.height - FRAME - AIR) / aspect);
-      setPreviewW(Math.max(40, Math.floor(w)));
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-    // Re-measure when the preview mounts, the device (aspect) changes, or the layout switches.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasPreview, design?.device, design?.custom?.width, design?.custom?.height, desktop]);
+  // Fit the phone into the available space (measured whenever the preview box mounts or resizes).
+  const device = design ? getDevice(design.device, design.custom) : null;
+  const {
+    boxRef,
+    box: previewBox,
+    width: previewW,
+  } = useFitPhone(device ? device.height / device.width : null, desktop);
 
   const refresh = useCallback(async () => {
     setRefreshAt(Date.now());
@@ -204,7 +183,7 @@ export default function StudioPage() {
   const warnings = report?.warnings ?? [];
   const snapshot = () => buildSnapshot(data, m, motivation.line);
   const makeThumb = () => {
-    const c = previewBox.current?.querySelector('canvas');
+    const c = previewBox?.querySelector('canvas');
     return c ? thumbnailFrom(c) : null;
   };
 
@@ -286,21 +265,23 @@ export default function StudioPage() {
 
   const preview = (
     <div
-      ref={previewBox}
+      ref={boxRef}
       className={cn(
         'flex items-center justify-center',
         // Mobile: whatever height is left between the title and the editor (measured, see above).
         desktop ? 'h-[calc(100dvh-120px)]' : 'min-h-0 flex-1',
       )}
     >
-      <PhonePreview
-        design={design}
-        data={wpData}
-        width={previewW}
-        showUi={showUi}
-        showSafe={showSafe}
-        onReport={setReport}
-      />
+      {previewW !== null && (
+        <PhonePreview
+          design={design}
+          data={wpData}
+          width={previewW}
+          showUi={showUi}
+          showSafe={showSafe}
+          onReport={setReport}
+        />
+      )}
     </div>
   );
 

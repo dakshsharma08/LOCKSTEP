@@ -11,7 +11,7 @@ import { Button } from '@/components/ui/button';
 import { FeasibilityBadge } from '@/components/ui/badges';
 import { useGoal } from '@/db/hooks';
 import { savePlanResult, saveStarterPlan, startManualPlan } from '@/db/repo';
-import { ApiCallError, streamPlan } from '@/lib/api';
+import { ApiCallError, NO_DATA_DETAIL, streamPlan } from '@/lib/api';
 import { usePlanner } from '@/stores/planner';
 import { shortDate } from '@/lib/metrics';
 import type { ApiError, PlanFeasibilityEvent, PlanStatusEvent } from '@shared/api';
@@ -33,6 +33,16 @@ export default function PlanningPage() {
   const [error, setError] = useState<ApiError | null>(null);
   const ctrl = useRef<AbortController | null>(null);
   const startedFor = useRef<string | null>(null);
+  // Seconds since this attempt started: shown while waiting, and after a while a way out (starter plan).
+  const [startedAt, setStartedAt] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (phase !== 'streaming') return;
+    const tick = () => setElapsed(Math.floor((Date.now() - startedAt) / 1000));
+    tick();
+    const t = setInterval(tick, 1000);
+    return () => clearInterval(t);
+  }, [phase, startedAt]);
 
   const run = useCallback(async () => {
     if (!goal) return;
@@ -40,6 +50,8 @@ export default function PlanningPage() {
     const c = new AbortController();
     ctrl.current = c;
     setPhase('streaming');
+    setStartedAt(Date.now());
+    setElapsed(0);
     setError(null);
     setMilestones([]);
     setFeas(null);
@@ -130,6 +142,7 @@ export default function PlanningPage() {
   /** Gemini can't plan right now: start from a rule-based starter plan (labelled as such, never as AI). */
   async function buildFromStarter() {
     if (!goal) return;
+    ctrl.current?.abort(); // stop waiting (the server then stops its Gemini call too)
     if (await saveStarterPlan(goal.id)) {
       navigate(`/goals/${goal.id}/review`);
       return;
@@ -169,19 +182,31 @@ export default function PlanningPage() {
               <span className="relative inline-flex size-2.5 rounded-full bg-gold" />
             </span>
             {status?.message ?? 'Thinking…'}
+            {elapsed >= 5 && <span className="font-mono tabular">· {elapsed} s</span>}
           </span>
         )}
         {feas && <FeasibilityBadge value={feas.feasibility} prefix="Gemini:" />}
         {phase === 'streaming' && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={cancel}
-            icon={<X className="size-4" strokeWidth={1.5} />}
-            className="ml-auto"
-          >
-            Cancel
-          </Button>
+          <div className="ml-auto flex flex-wrap gap-1">
+            {elapsed >= 20 && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => void buildFromStarter()}
+                icon={<ListChecks className="size-4" strokeWidth={1.5} />}
+              >
+                Use a starter plan instead
+              </Button>
+            )}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={cancel}
+              icon={<X className="size-4" strokeWidth={1.5} />}
+            >
+              Cancel
+            </Button>
+          </div>
         )}
       </div>
       {feas && <p className="mt-3 text-sm text-muted">{feas.feasibilityReason}</p>}
@@ -304,7 +329,7 @@ function errorTitle(e: ApiError): string {
     case 'RATE_LIMITED':
       return 'Too many requests';
     case 'TIMEOUT':
-      return 'Gemini took too long';
+      return e.details?.includes(NO_DATA_DETAIL) ? 'Lost contact with the server' : 'Gemini took too long';
     case 'PLAN_INVALID':
       return "Gemini's plan didn't pass our checks";
     case 'INVALID_INPUT':

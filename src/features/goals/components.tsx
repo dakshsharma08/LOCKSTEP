@@ -9,13 +9,14 @@ import type { GoalData } from '@/db/hooks';
 import { type GoalMetrics, goalMetrics, minutesLabel, paceLabel, shortDate, stateLabel } from '@/lib/metrics';
 import { useMinute, useNow } from '@/lib/ticker';
 import { cn } from '@/lib/cn';
-import { toggleTask, logMinutes, getKv, setKv, recordRuns } from '@/db/repo';
+import { toggleTask, logMinutes, getKv } from '@/db/repo';
 import type { TaskRow, GoalRow } from '@/db/db';
 import { ProgressRing } from '@/components/ui/misc';
 import { Button } from '@/components/ui/button';
 import { Dialog } from '@/components/ui/dialog';
 import { Field, Input } from '@/components/ui/form';
-import { getHealth, getMotivation } from '@/lib/api';
+import { getHealth } from '@/lib/api';
+import { requestMotivation } from '@/lib/motivation';
 import { formatInZone, type Countdown, type TimeParts } from '@shared/time';
 
 /** Live metrics (re-computed every second via the shared ticker). */
@@ -406,50 +407,53 @@ export function useMotivation(
   const cacheKey =
     goal && dateKey ? `motivation:${goal.id}:${dateKey}:${Math.round((m?.progress ?? 0) * 20)}` : null;
   const health = useQuery({ queryKey: ['health'], queryFn: getHealth, staleTime: 60_000 });
+  const aiOn = health.data?.ai.configured === true;
+  const active = goal?.status === 'active';
   const local = m && goal ? localMotivation(m) : null;
-  const [cached, setCached] = useState<string | null>(null);
-  const asked = useRef<string | null>(null);
+  const [ai, setAi] = useState<{ key: string; line: string } | null>(null);
+  // The newest numbers, read when a request is made. The goal and metrics objects change identity on
+  // almost every render; the request must depend only on WHAT is asked (cacheKey), never on that.
+  const latest = useRef({ goal, m });
+  useEffect(() => {
+    latest.current = { goal, m };
+  });
 
   useEffect(() => {
     if (!cacheKey) return;
-    let cancelled = false;
-    void getKv<string>(cacheKey).then((v) => !cancelled && setCached(v ?? null));
+    let alive = true;
+    void (async () => {
+      // The stored line first: never ask Gemini for a line this device already has.
+      const stored = await getKv<string>(cacheKey).catch(() => undefined);
+      if (!alive) return;
+      if (stored) {
+        setAi({ key: cacheKey, line: stored });
+        return;
+      }
+      const { goal: g, m: now } = latest.current;
+      if (!aiOn || !active || !g || !now) return;
+      // One shared request per goal/day/progress step; kept even if this screen unmounts (lib/motivation.ts).
+      const line = await requestMotivation(
+        cacheKey,
+        {
+          goal: g.title,
+          daysLeft: now.countdown.daysLeft,
+          percentDone: Math.round(now.progress * 100),
+          nextMilestone: now.nextMilestone?.title ?? null,
+          streak: now.streak,
+          pace: now.pace,
+          state: now.countdown.state,
+          dateKey: now.countdown.todayKey,
+        },
+        g.id,
+      );
+      if (alive && line) setAi({ key: cacheKey, line });
+    })();
     return () => {
-      cancelled = true;
+      alive = false;
     };
-  }, [cacheKey]);
+  }, [cacheKey, aiOn, active]);
 
-  useEffect(() => {
-    if (!goal || !m || !cacheKey || cached || !health.data?.ai.configured || asked.current === cacheKey)
-      return;
-    if (goal.status !== 'active') return;
-    asked.current = cacheKey;
-    const ctrl = new AbortController();
-    getMotivation(
-      {
-        goal: goal.title,
-        daysLeft: m.countdown.daysLeft,
-        percentDone: Math.round(m.progress * 100),
-        nextMilestone: m.nextMilestone?.title ?? null,
-        streak: m.streak,
-        pace: m.pace,
-        state: m.countdown.state,
-        dateKey: m.countdown.todayKey,
-      },
-      ctrl.signal,
-    )
-      .then(async (r) => {
-        await setKv(cacheKey, r.line);
-        await recordRuns([r.run], goal.id);
-        setCached(r.line);
-      })
-      .catch(() => {
-        /* fall back to the local line silently */
-      });
-    return () => ctrl.abort();
-  }, [goal, m, cacheKey, cached, health.data]);
-
-  if (cached) return { line: cached, source: 'ai' };
+  if (ai && ai.key === cacheKey) return { line: ai.line, source: 'ai' };
   return { line: local, source: local ? 'local' : null };
 }
 

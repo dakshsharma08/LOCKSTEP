@@ -15,6 +15,10 @@ const ReminderScheduler = lazy(() =>
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false, staleTime: 60_000 } },
 });
+// The server check that every AI feature depends on: retry a failed check twice (1 s, 2 s), so one cold
+// start or network blip doesn't hide Gemini until the page is reloaded. React Query keeps the last good
+// answer while a later check fails, and checks again when the device comes back online.
+queryClient.setQueryDefaults(['health'], { retry: 2 });
 
 export function App() {
   const mode = useUi((s) => s.mode);

@@ -48,33 +48,99 @@ function toApiError(status: number, body: unknown): ApiError {
   };
 }
 
+/**
+ * Last-resort client limits, so no request can leave the UI waiting forever (e.g. a phone connection that
+ * dies silently). They sit ABOVE the server's own limits (30 s per Gemini call, retries and up to two
+ * alternative models; Vercel stops a function at 300 s), so they never cut off an answer that is coming.
+ */
+export const CLIENT_LIMITS = {
+  /** One JSON API call (motivation, coach, weekly insight, background). */
+  jsonMs: 180_000,
+  /** GET /api/health (the server bounds its own model listing). */
+  healthMs: 10_000,
+  /** The plan stream: the server sends a keep-alive every 15 s, so this much silence means the connection is gone. */
+  planSilenceMs: 45_000,
+};
+
+/** Marks a client-side "no answer" (as opposed to the server's own TIMEOUT for a slow Gemini). */
+export const NO_DATA_DETAIL = 'No data from the LOCKSTEP server (the connection may have dropped).';
+
+const NO_ANSWER: ApiError = {
+  code: 'TIMEOUT',
+  message:
+    'The LOCKSTEP server stopped answering (the connection may have dropped). Your saved plans still work. Please try again.',
+  retryable: true,
+  details: [NO_DATA_DETAIL],
+};
+
+/**
+ * A signal that aborts when the caller's signal does OR after `ms`, and tells the two apart afterwards.
+ * Plain AbortController + setTimeout on purpose: AbortSignal.any / AbortSignal.timeout are missing on
+ * older iOS Safari, where they would break every AI call. Call `done()` when the request has finished.
+ */
+function withLimit(ms: number, signal?: AbortSignal) {
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctrl.abort();
+  }, ms);
+  const follow = () => ctrl.abort();
+  if (signal?.aborted) ctrl.abort();
+  else signal?.addEventListener('abort', follow, { once: true });
+  return {
+    signal: ctrl.signal,
+    timedOut: () => timedOut,
+    done: () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', follow);
+    },
+  };
+}
+
 async function postJson<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
   if (typeof navigator !== 'undefined' && navigator.onLine === false) throw new ApiCallError(OFFLINE, 0);
+  const limit = withLimit(CLIENT_LIMITS.jsonMs, signal);
   let res: Response;
+  let data: unknown;
   try {
     res = await fetch(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal,
+      signal: limit.signal,
     });
+    data = await res.json().catch(() => null);
   } catch (e) {
-    if ((e as Error).name === 'AbortError') throw e;
+    if (limit.timedOut()) throw new ApiCallError(NO_ANSWER, 0);
+    if (signal?.aborted || (e as Error).name === 'AbortError') throw e;
     throw new ApiCallError(OFFLINE, 0);
+  } finally {
+    limit.done();
   }
-  const data = await res.json().catch(() => null);
   if (!res.ok) throw new ApiCallError(toApiError(res.status, data), res.status);
   return data as T;
 }
 
-export async function getHealth(): Promise<HealthResponse | null> {
+/**
+ * GET /api/health. THROWS when the server can't be reached or answers with an error, so React Query
+ * retries it and keeps the last good answer, instead of caching "no server" as a success (which used to
+ * hide Gemini planning until the page was reloaded after one failed check).
+ */
+export async function getHealth(): Promise<HealthResponse> {
+  const limit = withLimit(CLIENT_LIMITS.healthMs);
+  let res: Response;
+  let data: unknown;
   try {
-    const res = await fetch('/api/health');
-    if (!res.ok) return null;
-    return (await res.json()) as HealthResponse;
+    res = await fetch('/api/health', { signal: limit.signal });
+    data = await res.json().catch(() => null);
   } catch {
-    return null;
+    throw new ApiCallError(limit.timedOut() ? NO_ANSWER : OFFLINE, 0);
+  } finally {
+    limit.done();
   }
+  if (!res.ok || !data) throw new ApiCallError(toApiError(res.status, data), res.status);
+  return data as HealthResponse;
 }
 
 export const getMotivation = (req: MotivationRequest, signal?: AbortSignal) =>
@@ -92,34 +158,74 @@ export const getWeeklyInsight = (req: WeeklyInsightRequest, signal?: AbortSignal
 /**
  * Stream a plan from POST /api/plan (Server-Sent Events over fetch, because
  * EventSource can't POST). Calls `onEvent` for each event. Abort with the signal.
+ *
+ * A watchdog ends the wait if NOTHING arrives (not even the server's 15 s keep-alive) for
+ * `silenceMs`: the connection is gone, so the user gets a clear error instead of an endless spinner.
  */
 export async function streamPlan(
   intake: IntakeInput,
   onEvent: (e: PlanStreamEvent) => void,
   signal: AbortSignal,
+  opts: { silenceMs?: number } = {},
 ): Promise<void> {
   if (navigator.onLine === false) throw new ApiCallError(OFFLINE, 0);
-  let res: Response;
+  const silenceMs = opts.silenceMs ?? CLIENT_LIMITS.planSilenceMs;
+  // One controller for both reasons to stop: the caller's signal, or the watchdog (no AbortSignal.any:
+  // older iOS Safari lacks it).
+  const both = new AbortController();
+  const follow = () => both.abort();
+  if (signal.aborted) both.abort();
+  else signal.addEventListener('abort', follow, { once: true });
+  let silent = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const arm = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      silent = true;
+      both.abort();
+    }, silenceMs);
+  };
+  arm();
   try {
-    res = await fetch('/api/plan', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-      body: JSON.stringify(intake),
-      signal,
+    let res: Response;
+    try {
+      res = await fetch('/api/plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+        body: JSON.stringify(intake),
+        signal: both.signal,
+      });
+    } catch (e) {
+      if (silent) throw new ApiCallError(NO_ANSWER, 0);
+      if (signal.aborted || (e as Error).name === 'AbortError') throw e;
+      throw new ApiCallError(OFFLINE, 0);
+    }
+    if (!res.ok || !res.body || !res.headers.get('content-type')?.includes('text/event-stream')) {
+      const data = await res.json().catch(() => null);
+      throw new ApiCallError(toApiError(res.status, data), res.status);
+    }
+    await readEvents(res.body, onEvent, arm).catch((e: unknown) => {
+      if (silent) throw new ApiCallError(NO_ANSWER, 0);
+      throw e;
     });
-  } catch (e) {
-    if ((e as Error).name === 'AbortError') throw e;
-    throw new ApiCallError(OFFLINE, 0);
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener('abort', follow);
   }
-  if (!res.ok || !res.body || !res.headers.get('content-type')?.includes('text/event-stream')) {
-    const data = await res.json().catch(() => null);
-    throw new ApiCallError(toApiError(res.status, data), res.status);
-  }
-  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+}
+
+/** Read SSE messages; `onBytes` is called for every chunk (keep-alives included) to re-arm the watchdog. */
+async function readEvents(
+  body: NonNullable<Response['body']>,
+  onEvent: (e: PlanStreamEvent) => void,
+  onBytes: () => void,
+): Promise<void> {
+  const reader = body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = '';
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
+    onBytes();
     buffer += value;
     let idx: number;
     // SSE messages are separated by a blank line.

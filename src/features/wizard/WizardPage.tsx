@@ -5,7 +5,16 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { AnimatePresence, motion } from 'framer-motion';
-import { ArrowLeft, ArrowRight, Sparkles, Wand2, PenLine, Globe2, CalendarClock } from 'lucide-react';
+import {
+  ArrowLeft,
+  ArrowRight,
+  Sparkles,
+  Wand2,
+  PenLine,
+  Globe2,
+  CalendarClock,
+  RotateCcw,
+} from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
@@ -507,8 +516,18 @@ export default function WizardPage() {
                   >
                     <p className="font-medium text-text">Can't reach the LOCKSTEP server right now.</p>
                     <p className="mt-1 text-muted">
-                      You may be offline. You can still build the plan yourself.
+                      You may be offline. You can still build the plan yourself, or check again.
                     </p>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      className="mt-3"
+                      loading={health.isFetching}
+                      onClick={() => void health.refetch()}
+                      icon={<RotateCcw className="size-4" strokeWidth={1.5} />}
+                    >
+                      Check again
+                    </Button>
                   </div>
                 )}
               </div>
