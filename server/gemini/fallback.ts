@@ -2,9 +2,10 @@
  * Model fallback for TEMPORARY Gemini outages (HTTP 503 "high demand", 500/502/504, 429, or a request
  * that Google accepted but never answered).
  *
- * Why (for learners): `gemini-3.8-flash` stays the primary model. But Google sometimes answers 503
- * UNAVAILABLE for a model while other models work fine, and a deadline-driven app should not just give
- * up. So when the primary is temporarily unavailable we try a small number of alternatives, then stop.
+ * Why (for learners): the primary model (GEMINI_MODEL, or the default; see client.ts) is tried first.
+ * But Google sometimes answers 503 UNAVAILABLE for a model while other models work fine, and a
+ * deadline-driven app should not just give up. So when the primary is temporarily unavailable we
+ * try a small number of alternatives, then stop.
  *
  * Rules (each one is covered by a test):
  *   • Only TEMPORARY failures on the primary trigger a fallback. A 400 (bad request), 401/403 (key) or

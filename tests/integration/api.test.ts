@@ -382,7 +382,7 @@ describe('GET /api/health', () => {
     expect(captured).toHaveLength(0);
   });
 
-  it('with a key, picks the newest STABLE flash model once and caches it', async () => {
+  it('a key that does not list the default model: picks the newest STABLE flash model once and caches it', async () => {
     let listCalls = 0;
     mock.use(
       http.get(LIST_URL, ({ request }) => {
@@ -423,13 +423,35 @@ describe('GET /api/health', () => {
     expect(listCalls).toBe(1);
   });
 
-  it('falls back to gemini-flash-latest when listing fails', async () => {
+  it('uses the default model gemini-3.1-flash-lite when the key lists it', async () => {
+    mock.use(
+      http.get(LIST_URL, () =>
+        HttpResponse.json({
+          models: ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.1-flash-lite'].map((n) => ({
+            name: `models/${n}`,
+            supportedGenerationMethods: ['generateContent'],
+          })),
+        }),
+      ),
+    );
+    const base = await start({ env: { GEMINI_API_KEY: TEST_KEY } });
+    const body = (await (await fetch(`${base}/api/health`)).json()) as HealthResponse;
+    expect(body.ai.model).toBe('gemini-3.1-flash-lite');
+  });
+
+  it('GEMINI_MODEL still overrides the default model', async () => {
+    const base = await start({ env: { GEMINI_API_KEY: TEST_KEY, GEMINI_MODEL: 'gemini-3.5-flash' } });
+    const body = (await (await fetch(`${base}/api/health`)).json()) as HealthResponse;
+    expect(body.ai.model).toBe('gemini-3.5-flash');
+  });
+
+  it('uses the default model when listing fails (not the alias, which can point at an exhausted model)', async () => {
     mock.use(
       http.get(LIST_URL, () => HttpResponse.json({ error: { code: 500, message: 'x' } }, { status: 500 })),
     );
     const base = await start({ env: { GEMINI_API_KEY: TEST_KEY } });
     const body = (await (await fetch(`${base}/api/health`)).json()) as HealthResponse;
-    expect(body.ai.model).toBe('gemini-flash-latest');
+    expect(body.ai.model).toBe('gemini-3.1-flash-lite');
   });
 
   it('answers unknown /api routes with a JSON 404', async () => {

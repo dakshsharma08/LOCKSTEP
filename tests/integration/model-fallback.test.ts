@@ -891,3 +891,61 @@ describe("Google's continuation protocol (SDK automatic continuation)", () => {
     expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-3.5-flash');
   });
 });
+
+describe('default primary model (GEMINI_MODEL not set)', () => {
+  const LISTED = [...KEY_MODELS, 'gemini-3.1-flash-lite'];
+
+  it('the plan is written by gemini-3.1-flash-lite when the key lists it: one call, no fallback', async () => {
+    fake = await startFakeGemini(() => undefined, { models: LISTED });
+    const app = createApp({
+      now: () => NOW,
+      env: { GEMINI_API_KEY: KEY, ALLOWED_ORIGINS: '' },
+      gemini: new GoogleGenAI({ apiKey: KEY, httpOptions: { baseUrl: fake.baseUrl } }) as never,
+      tuning: {
+        firstChunkTimeoutMs: 300,
+        retryBaseMs: 1,
+        retryMaxMs: 2,
+        rateLimit: { windowMax: 1000, dayMax: 10000, windowSec: 600 },
+      },
+    });
+    server = app.listen(0, '127.0.0.1');
+    await new Promise((r) => server!.once('listening', r));
+    const events = await plan(`http://127.0.0.1:${(server.address() as AddressInfo).port}`);
+
+    expect(events.at(-1)?.event).toBe('result');
+    expect(streams()).toEqual(['gemini-3.1-flash-lite']);
+    expect(events.at(-1)!.data.runs.at(-1)).toMatchObject({ model: 'gemini-3.1-flash-lite', ok: true });
+    const sent = fake.requests.find((r) => r.stream)!;
+    expect(levelOf(sent)).toEqual({ includeThoughts: true, thinkingLevel: 'LOW' }); // same settings as before
+  });
+
+  it('the existing fallback logic is kept: default busy → gemini-3.5-flash', async () => {
+    fake = await startFakeGemini(
+      (r) => (r.stream && r.model === 'gemini-3.1-flash-lite' ? OVERLOADED : undefined),
+      {
+        models: LISTED,
+      },
+    );
+    const app = createApp({
+      now: () => NOW,
+      env: { GEMINI_API_KEY: KEY, ALLOWED_ORIGINS: '' },
+      gemini: new GoogleGenAI({ apiKey: KEY, httpOptions: { baseUrl: fake.baseUrl } }) as never,
+      tuning: {
+        firstChunkTimeoutMs: 300,
+        retryBaseMs: 1,
+        retryMaxMs: 2,
+        rateLimit: { windowMax: 1000, dayMax: 10000, windowSec: 600 },
+      },
+    });
+    server = app.listen(0, '127.0.0.1');
+    await new Promise((r) => server!.once('listening', r));
+    const events = await plan(`http://127.0.0.1:${(server.address() as AddressInfo).port}`);
+
+    expect(events.at(-1)?.event).toBe('result');
+    expect(streams()).toEqual(['gemini-3.1-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.5-flash']);
+    expect(events.find((e) => e.event === 'reset')?.data).toMatchObject({
+      from: 'gemini-3.1-flash-lite',
+      to: 'gemini-3.5-flash',
+    });
+  });
+});

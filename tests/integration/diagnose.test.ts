@@ -424,3 +424,25 @@ describe('diagnose: what the SDK hides (wire probe), cut-off answers and speed',
     );
   });
 });
+
+describe('diagnose: chooses the model the same way as the app', () => {
+  it('no --model and no GEMINI_MODEL: the default gemini-3.1-flash-lite, because this key lists it', async () => {
+    const { report, text } = await diagnose(() => undefined, { model: undefined, env: {}, skipPlan: true }, [
+      'gemini-3.8-flash',
+      'gemini-3.5-flash',
+      'gemini-3.1-flash-lite',
+    ]);
+    expect(report).toMatchObject({ model: 'gemini-3.1-flash-lite', modelSource: 'default' });
+    expect(text).toMatch(
+      /Model under test: gemini-3\.1-flash-lite \(this app's default model, listed for this key\)/,
+    );
+  });
+
+  it('a key without the default: the newest stable Flash model, as before', async () => {
+    const { report } = await diagnose(() => undefined, { model: undefined, env: {}, skipPlan: true }, [
+      'gemini-3.8-flash',
+      'gemini-3.5-flash',
+    ]);
+    expect(report).toMatchObject({ model: 'gemini-3.8-flash', modelSource: 'auto-picked' });
+  });
+});

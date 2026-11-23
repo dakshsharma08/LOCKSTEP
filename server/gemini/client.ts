@@ -5,11 +5,10 @@
  * - `GeminiLike` is the small slice of the @google/genai SDK we actually use.
  *   The real `GoogleGenAI` object fits it, and tests could pass a fake. (Our
  *   integration tests use the REAL SDK and mock the network with MSW instead.)
- * - Model names change often, so by default we don't hard-code one. We ask the
- *   API which models this key can use (`models.list()`), keep only STABLE Flash
- *   models (`gemini-X.Y-flash`, no -lite/-preview/-exp/-image/-tts/-live) and pick
- *   the newest version. The answer is cached for an hour. If listing fails we use
- *   Google's moving alias `gemini-flash-latest`.
+ * - Which model plans (see chooseDefaultModel): GEMINI_MODEL if set; otherwise the
+ *   default `gemini-3.1-flash-lite` if THIS key lists it (`models.list()`, cached for
+ *   an hour); otherwise the newest STABLE Flash model the key lists (`gemini-X.Y-flash`,
+ *   no -lite/-preview/-exp/-image/-tts/-live); otherwise Google's alias `gemini-flash-latest`.
  */
 import {
   GoogleGenAI,
@@ -43,6 +42,30 @@ export function createGeminiClient(
 }
 
 export const FALLBACK_MODEL = 'gemini-flash-latest';
+
+/**
+ * The default model for this submission: on the developer's key (2026-11-23) it wrote a valid plan and
+ * the whole /api/plan flow passed in 7.3 s with 7/7 code checks, while the larger Flash models' free-tier
+ * quotas were used up. GEMINI_MODEL overrides it; if a key does not list it, the newest stable Flash
+ * model is used as before.
+ */
+export const DEFAULT_PRIMARY_MODEL = 'gemini-3.1-flash-lite';
+
+/**
+ * The model to use when GEMINI_MODEL is not set.
+ *   names = the models this key lists, or null when listing failed.
+ * Listing failed → the default (a verified model is a better bet than the moving alias, which can point
+ * at a model whose quota is used up). Default listed → the default. Otherwise the newest stable Flash
+ * model, else the alias.
+ */
+export function chooseDefaultModel(
+  names: readonly string[] | null,
+  defaultModel: string = DEFAULT_PRIMARY_MODEL,
+): string {
+  if (names === null) return defaultModel;
+  if (names.some((n) => n.replace(/^models\//, '') === defaultModel)) return defaultModel;
+  return pickNewestStableFlash(names) ?? FALLBACK_MODEL;
+}
 
 // gemini-3.8-flash, gemini-3-flash and pinned stable revisions like gemini-2.0-flash-001.
 const STABLE_FLASH = /^gemini-(\d+)(?:\.(\d+))?-flash(?:-(\d{3}))?$/;
@@ -84,6 +107,8 @@ export interface ModelResolverOptions {
   nowMs?: () => number;
   /** Explicit alternatives (GEMINI_MODEL_FALLBACKS). null = pick automatically; [] = disabled. */
   fallbacks?: string[] | null;
+  /** The model used when GEMINI_MODEL is not set and this key lists it (default DEFAULT_PRIMARY_MODEL). */
+  defaultModel?: string;
   /** Most alternatives to return. */
   maxFallbacks?: number;
 }
@@ -146,17 +171,18 @@ export class ModelResolver {
   }
 
   private async lookup(): Promise<string> {
+    const defaultModel = this.opts.defaultModel ?? DEFAULT_PRIMARY_MODEL;
+    let names: string[] | null;
     try {
-      const picked = pickNewestStableFlash(await this.listedNames());
-      if (picked) {
-        this.cached = { model: picked, until: this.nowMs() + this.opts.cacheMs };
-        return picked;
-      }
+      names = await this.listedNames();
     } catch {
-      // Listing failed (network, permissions…). The alias below still works.
+      names = null; // listing failed (network, permissions, overload…)
     }
-    this.cached = { model: FALLBACK_MODEL, until: this.nowMs() + (this.opts.failCacheMs ?? 5 * 60 * 1000) };
-    return FALLBACK_MODEL;
+    const model = chooseDefaultModel(names, defaultModel);
+    // A choice made without the list is re-checked sooner.
+    const ttl = names === null ? (this.opts.failCacheMs ?? 5 * 60 * 1000) : this.opts.cacheMs;
+    this.cached = { model, until: this.nowMs() + ttl };
+    return model;
   }
 
   private names: { list: string[]; until: number } | null = null;

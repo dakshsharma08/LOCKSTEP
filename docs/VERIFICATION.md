@@ -240,3 +240,9 @@ Sizes (the app's own prompt builders): input ≈ 1,400 tokens; a rich plan (7 mi
 - **Tested:** cut-off (no finish, MAX_TOKENS) → next model with no repair; all cut off → honest message; continuation across 2 hops completes and is logged; a resume slower than the gap limit becomes a stall; diagnostic wire probe (requests, bytes, comments), CUT OFF, CONTINUATION, KEEP-ALIVES, SPEED. Mutation-checked.
 - **NOT verified against real Gemini.**
 
+## 18. Default primary model: `gemini-3.1-flash-lite`
+
+- **Real evidence (the owner's Windows run, not mine):** `gemini-3.1-flash-lite` generated a valid plan; the complete `/api/plan` flow passed in 7.3 s with 7/7 code checks. The larger Flash models had used up their free-tier quotas.
+- **Change:** without `GEMINI_MODEL`, the app uses `gemini-3.1-flash-lite` if the key lists it, otherwise the newest stable Flash model (as before); if listing fails, the default. `GEMINI_MODEL` and `GEMINI_MODEL_FALLBACKS` still override. Fallbacks, retries, time limits, prompt, schema and validation are unchanged. No key in code.
+- **Tested:** the selection rule (listed, not listed, no usable model, listing failed, custom default); `ModelResolver` (GEMINI_MODEL wins; default; old rule on a key without it; listing failure; fallbacks after the default are 3.5 then 3.6); `/api/health` reports the default, GEMINI_MODEL overrides it, listing failure gives the default; a full plan is written by the default with LOW thinking in one call; default busy → `gemini-3.5-flash` with a reset; the diagnostic picks and names the same model. Mutation-checked.
+

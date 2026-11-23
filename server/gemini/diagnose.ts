@@ -21,7 +21,7 @@ import { createApp } from '../app';
 import { SCHEMA_REJECTION, upstreamStatus } from '../lib/errors';
 import { redactSecrets, registerSecrets, upstreamReason } from '../lib/redact';
 import { partsText } from './call';
-import { pickNewestStableFlash } from './client';
+import { chooseDefaultModel, DEFAULT_PRIMARY_MODEL, FALLBACK_MODEL } from './client';
 import { parseFallbackList, pickFallbacks } from './fallback';
 import { buildPlanSystemInstruction, buildPlanUserParts } from './prompts';
 import { preparePlanJob } from './plan';
@@ -119,7 +119,7 @@ export interface DiagReport {
     modelEnv: string | null;
   };
   model: string;
-  modelSource: 'option' | 'GEMINI_MODEL' | 'auto-picked' | 'fallback';
+  modelSource: 'option' | 'GEMINI_MODEL' | 'default' | 'auto-picked' | 'fallback';
   reach: ReachResult[];
   minimal: { version: string; kind: 'generate' | 'stream'; timing: StreamTiming }[];
   plan: { variant: 'A' | 'B' | 'C'; label: string; thinking: ThinkingConfig | null; timing: StreamTiming }[];
@@ -547,15 +547,28 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
   if (report.env.proxies.length)
     say(`Proxy-related environment variables set: ${report.env.proxies.join(', ')}`);
 
-  // Which model? Same rule as the server: GEMINI_MODEL, else the newest stable Flash the key can list.
+  // Which model? Same rule as the server (chooseDefaultModel): GEMINI_MODEL, else the default model if the
+  // key lists it, else the newest stable Flash model it lists. (An empty list = listing failed.)
   if (o.model) [report.model, report.modelSource] = [o.model, 'option'];
   else if (report.env.modelEnv) [report.model, report.modelSource] = [report.env.modelEnv, 'GEMINI_MODEL'];
   else {
-    const picked = pickNewestStableFlash(await listNames(base, o.apiKey, 'v1beta', reachCap));
-    [report.model, report.modelSource] = picked
-      ? [picked.replace(/^models\//, ''), 'auto-picked']
-      : ['gemini-flash-latest', 'fallback'];
+    const listedNow = await listNames(base, o.apiKey, 'v1beta', reachCap);
+    const picked = chooseDefaultModel(listedNow.length > 0 ? listedNow : null).replace(/^models\//, '');
+    report.model = picked;
+    report.modelSource =
+      picked === DEFAULT_PRIMARY_MODEL ? 'default' : picked === FALLBACK_MODEL ? 'fallback' : 'auto-picked';
   }
+  say(
+    `Model under test: ${report.model} (${
+      {
+        option: '--model',
+        GEMINI_MODEL: 'GEMINI_MODEL',
+        default: "this app's default model, listed for this key",
+        'auto-picked': 'newest stable Flash model this key lists',
+        fallback: 'alias: this key lists no stable Flash model',
+      }[report.modelSource]
+    })`,
+  );
 
   // 1 + 2. Reachability, key and model availability on both API versions.
   say('\n[1/6] Reaching Google and checking the key + model (raw HTTP, no SDK)');

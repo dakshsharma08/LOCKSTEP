@@ -136,7 +136,7 @@ export function createAiRouter(deps: AiDeps): Router {
     try {
       const model = await models.resolve();
       models.warmFallbacks();
-      // The primary stays gemini-3.8-flash (or GEMINI_MODEL). Alternatives are only looked up if it fails.
+      // The primary is GEMINI_MODEL or the default (see chooseDefaultModel). Alternatives are only looked up if it fails.
       const pool: ModelPool = {
         primary: model,
         fallbacks: () => models.fallbacksFor(model),
