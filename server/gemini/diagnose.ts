@@ -77,6 +77,15 @@ export interface StreamTiming {
   /** The longest silence between two chunks (ms), and after which chunk (1-based) it happened. */
   maxGapMs?: number;
   maxGapAfterChunk?: number;
+  /** The last finishReason (a complete answer ends with STOP). */
+  finishReason?: string;
+  /** Continuation checkpoints: the SDK opened this many EXTRA requests to resume a long answer. */
+  hops?: number;
+  /** Visible output tokens and prompt tokens (usage metadata). */
+  outputTokens?: number;
+  promptTokens?: number;
+  /** What actually came over the wire (seen through the SDK's fetch hook). */
+  wire?: { requests: number; bytes: number; reads: number; commentLines: number; lastByteMs?: number };
   tokens?: number;
   thoughtTokens?: number;
   jsonOk?: boolean;
@@ -237,13 +246,16 @@ async function timeStream(
   req: Request,
   capMs: number,
   expectJson = false,
+  probe?: WireProbe,
 ): Promise<StreamTiming> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), capMs);
   const t0 = performance.now();
+  if (probe) probe.stats.t0 = t0;
+  const wire = () => (probe ? { wire: probe.snapshot() } : {});
   let headersMs: number | undefined;
   // Chunk statistics live outside the try, so a stream that stalls still reports what it DID send.
-  const c: ChunkStats = { chunks: 0, thoughtChunks: 0, textChunks: 0 };
+  const c: ChunkStats = { chunks: 0, thoughtChunks: 0, textChunks: 0, hops: 0 };
   try {
     const stream = await ai.models.generateContentStream({
       model,
@@ -252,9 +264,17 @@ async function timeStream(
     });
     headersMs = performance.now() - t0;
     let text = '';
-    let usage: { totalTokenCount?: number; thoughtsTokenCount?: number } | undefined;
+    let usage:
+      | {
+          totalTokenCount?: number;
+          thoughtsTokenCount?: number;
+          candidatesTokenCount?: number;
+          promptTokenCount?: number;
+        }
+      | undefined;
     for await (const chunk of stream) {
-      const parts = chunk.candidates?.[0]?.content?.parts ?? [];
+      const cand = chunk.candidates?.[0];
+      const parts = cand?.content?.parts ?? [];
       const d = partsText(parts);
       countChunk(
         c,
@@ -262,6 +282,8 @@ async function timeStream(
         parts.some((p) => p.thought),
         !!d,
       );
+      if (cand?.finishReason !== undefined) c.finishReason = String(cand.finishReason);
+      if (cand?.continuationToken) c.hops++;
       if (d) text += d;
       if (chunk.usageMetadata) usage = chunk.usageMetadata;
     }
@@ -281,10 +303,13 @@ async function timeStream(
       totalMs: performance.now() - t0,
       tokens: usage?.totalTokenCount,
       thoughtTokens: usage?.thoughtsTokenCount,
+      outputTokens: usage?.candidatesTokenCount,
+      promptTokens: usage?.promptTokenCount,
       jsonOk,
+      ...wire(),
     };
   } catch (e) {
-    return { ...failed(e, ctrl.signal.aborted, headersMs, c.firstChunkMs, t0), ...chunkFields(c) };
+    return { ...failed(e, ctrl.signal.aborted, headersMs, c.firstChunkMs, t0), ...chunkFields(c), ...wire() };
   } finally {
     clearTimeout(timer);
   }
@@ -294,6 +319,8 @@ interface ChunkStats {
   chunks: number;
   thoughtChunks: number;
   textChunks: number;
+  hops: number;
+  finishReason?: string;
   firstChunkMs?: number;
   firstTextMs?: number;
   lastChunkMs?: number;
@@ -330,6 +357,65 @@ function chunkFields(c: ChunkStats): Partial<StreamTiming> {
     textChunks: c.textChunks,
     lastChunkMs: c.lastChunkMs,
     ...(c.maxGapMs !== undefined ? { maxGapMs: c.maxGapMs, maxGapAfterChunk: c.maxGapAfterChunk } : {}),
+    ...(c.finishReason !== undefined ? { finishReason: c.finishReason } : {}),
+    ...(c.hops > 0 ? { hops: c.hops } : {}),
+  };
+}
+
+interface WireStats {
+  t0: number;
+  requests: number;
+  bytes: number;
+  reads: number;
+  commentLines: number;
+  lastByteMs?: number;
+}
+interface WireProbe {
+  stats: WireStats;
+  fetch: typeof fetch;
+  snapshot: () => NonNullable<StreamTiming['wire']>;
+}
+
+/**
+ * A fetch for the SDK that passes every byte through unchanged but counts it: HTTP requests (the SDK can
+ * open extra ones to resume a long answer), bytes, reads, and SSE comment lines, which the SDK's parser
+ * drops (so a connection kept alive by comments looks silent to the app).
+ */
+function wireProbe(): WireProbe {
+  const stats: WireStats = { t0: performance.now(), requests: 0, bytes: 0, reads: 0, commentLines: 0 };
+  const decoder = new TextDecoder();
+  const probeFetch: typeof fetch = async (input, init) => {
+    stats.requests++;
+    const res = await fetch(input, init);
+    if (!res.body) return res;
+    const reader = res.body.getReader();
+    const body = new ReadableStream<Uint8Array>({
+      async pull(ctrl) {
+        const { done, value } = await reader.read();
+        if (done) {
+          ctrl.close();
+          return;
+        }
+        stats.reads++;
+        stats.bytes += value.byteLength;
+        stats.lastByteMs = performance.now() - stats.t0;
+        stats.commentLines += (decoder.decode(value, { stream: true }).match(/(^|\n):/g) ?? []).length;
+        ctrl.enqueue(value);
+      },
+      cancel: (reason) => reader.cancel(reason),
+    });
+    return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+  };
+  return {
+    stats,
+    fetch: probeFetch,
+    snapshot: () => ({
+      requests: stats.requests,
+      bytes: stats.bytes,
+      reads: stats.reads,
+      commentLines: stats.commentLines,
+      ...(stats.lastByteMs !== undefined ? { lastByteMs: stats.lastByteMs } : {}),
+    }),
   };
 }
 
@@ -386,7 +472,24 @@ function chunkLine(t: StreamTiming): string {
   const out = [`${t.chunks} chunks (${t.thoughtChunks ?? 0} thinking, ${t.textChunks ?? 0} text)`];
   if (t.lastChunkMs !== undefined) out.push(`last chunk at ${sec(t.lastChunkMs)}`);
   if (t.maxGapMs !== undefined) out.push(`longest gap ${sec(t.maxGapMs)} after chunk ${t.maxGapAfterChunk}`);
+  if (t.finishReason !== undefined || t.ok) out.push(`finish ${t.finishReason ?? 'NONE (cut off)'}`);
+  if (t.hops) out.push(`${t.hops} continuation hop(s)`);
+  if (t.outputTokens !== undefined) {
+    const rate = outputRate(t);
+    out.push(`${t.outputTokens} output tokens${rate ? ` (~${rate} tokens/s)` : ''}`);
+  }
+  if (t.wire)
+    out.push(
+      `wire: ${t.wire.requests} request(s), ${(t.wire.bytes / 1024).toFixed(1)} KB in ${t.wire.reads} reads, ${t.wire.commentLines} keep-alive comment(s)${t.wire.lastByteMs !== undefined ? `, last byte at ${sec(t.wire.lastByteMs)}` : ''}`,
+    );
   return out.join(' · ');
+}
+
+/** Visible output tokens per second while the answer was being written (first text → last chunk). */
+function outputRate(t: StreamTiming): number | null {
+  if (!t.outputTokens || t.firstTextMs === undefined || t.lastChunkMs === undefined) return null;
+  const s = (t.lastChunkMs - t.firstTextMs) / 1000;
+  return s > 0.5 ? Math.round(t.outputTokens / s) : null;
 }
 
 // ───────────────────────────── the run ─────────────────────────────
@@ -401,12 +504,19 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
   const planCap = o.planTimeoutMs ?? DEFAULT_TUNING.streamTotalTimeoutMs;
   const env = o.env ?? process.env;
   const thinkingSetting = parsePlanThinking(env.GEMINI_THINKING_LEVEL);
-  const mk = (apiVersion?: string) =>
+  const mk = (apiVersion?: string, fetchFn?: typeof fetch) =>
     new GoogleGenAI({
       apiKey: o.apiKey,
       ...(apiVersion ? { apiVersion } : {}),
-      ...(o.baseUrl ? { httpOptions: { baseUrl: base } } : {}),
+      ...(o.baseUrl || fetchFn
+        ? { httpOptions: { ...(o.baseUrl ? { baseUrl: base } : {}), ...(fetchFn ? { fetch: fetchFn } : {}) } }
+        : {}),
     });
+  /** A client whose HTTP traffic is observed (bytes, SSE comment lines, requests), for one plan request. */
+  const probed = (apiVersion?: string) => {
+    const probe = wireProbe();
+    return { ai: mk(apiVersion, probe.fetch), probe };
+  };
 
   const report: DiagReport = {
     env: {
@@ -560,7 +670,6 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
     ].filter(
       (v, i, all) => all.findIndex((w) => JSON.stringify(w.thinking) === JSON.stringify(v.thinking)) === i,
     );
-    const ai = mk(o.apiVersion);
     const planRequest = (thinking: ThinkingConfig | null | undefined) => ({
       contents: [{ role: 'user' as const, parts: buildPlanUserParts(job.intake) }],
       config: {
@@ -571,7 +680,8 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
       },
     });
     for (const v of variants) {
-      const timing = await timeStream(ai, report.model, planRequest(v.thinking), planCap, true);
+      const { ai: probedAi, probe } = probed(o.apiVersion);
+      const timing = await timeStream(probedAi, report.model, planRequest(v.thinking), planCap, true, probe);
       report.plan.push({ ...v, timing });
       say(`  ${v.variant} ${v.label}\n    ${timing.ok ? 'OK ' : 'FAIL'} ${timingLine(timing)}`);
       if (timing.status === 429 || timing.status === 503) {
@@ -583,12 +693,14 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
     // The same plan request (the app's real settings) to each alternative: does that model accept the
     // response schema? This is exactly what the app sends after falling back.
     for (const model of chain) {
+      const { ai: probedAi, probe } = probed(o.apiVersion);
       const timing = await timeStream(
-        ai,
+        probedAi,
         model,
         planRequest(planThinkingConfig(model, thinkingSetting)),
         planCap,
         true,
+        probe,
       );
       report.planAlternatives.push({ model, timing });
       say(`  plan request on ${model.padEnd(18)} ${timing.ok ? 'OK ' : 'FAIL'} ${timingLine(timing)}`);
@@ -849,9 +961,41 @@ export function diagnose(
           ? `THINKING STALL on ${model}: ${t.chunks} chunks, all thinking and no plan text yet, then silent for ${sec(silent)} until the ${sec(t.totalMs)} cap. The model was still thinking. Try GEMINI_THINKING_LEVEL=minimal, or put another model first.`
           : `STREAM STALL on ${model}: ${t.chunks} chunks (${t.thoughtChunks ?? 0} thinking, ${t.textChunks} text), then nothing for ${sec(silent)} until the ${sec(t.totalMs)} cap. Google accepted the request and started writing, then stopped sending; the app gives up on a stream after ${sec(idleLimit)} without a chunk.`,
       );
+    } else if (t.ok && t.finishReason !== 'STOP') {
+      out.push(
+        `CUT OFF on ${model}: the answer ended ${t.finishReason ? `with finishReason ${t.finishReason}` : 'without a finish reason'} after ${t.outputTokens ?? '?'} output and ${t.thoughtTokens ?? '?'} thinking tokens. The app never uses a cut-off answer; it starts over on the next model.`,
+      );
     } else if (t.ok && (t.maxGapMs ?? 0) > idleLimit) {
       out.push(
         `LONG PAUSE on ${model}: it finished, but paused ${sec(t.maxGapMs)} between two chunks (after chunk ${t.maxGapAfterChunk}). The app gives up after ${sec(idleLimit)} without a chunk, so in the app this request would have failed.`,
+      );
+    }
+  }
+
+  // What the SDK hides: extra requests to resume a long answer, and keep-alive bytes during a silence.
+  for (const { model, t } of [
+    ...r.plan.map((p) => ({ model: r.model, t: p.timing })),
+    ...r.planAlternatives.map((p) => ({ model: p.model, t: p.timing })),
+  ]) {
+    if (t.hops) {
+      out.push(
+        `CONTINUATION on ${model}: Google split the answer into ${t.hops + 1} requests (the SDK resumes automatically). Each reconnect is a pause between chunks${t.maxGapMs !== undefined ? ` (longest here: ${sec(t.maxGapMs)})` : ''} and an extra request against the quota.`,
+      );
+    }
+    if (t.wire?.commentLines) {
+      const alive =
+        !t.ok &&
+        t.wire.lastByteMs !== undefined &&
+        t.lastChunkMs !== undefined &&
+        t.wire.lastByteMs > t.lastChunkMs + 1000;
+      out.push(
+        `KEEP-ALIVES on ${model}: ${t.wire.commentLines} SSE comment line(s) arrived that the SDK hides${alive ? `; the connection was still sending at ${sec(t.wire.lastByteMs)} although the last chunk came at ${sec(t.lastChunkMs)}, so this "stall" was a live connection` : ''}.`,
+      );
+    }
+    if (t.ok && t.finishReason === 'STOP' && t.outputTokens !== undefined) {
+      const rate = outputRate(t);
+      out.push(
+        `SPEED on ${model}: first text at ${sec(t.firstTextMs)}, ${t.outputTokens} output tokens${rate ? ` at ~${rate} tokens/s` : ''}, ${t.thoughtTokens ?? 0} thinking tokens, ${sec(t.totalMs)} in total.`,
       );
     }
   }

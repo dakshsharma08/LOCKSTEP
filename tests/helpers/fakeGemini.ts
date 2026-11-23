@@ -45,6 +45,18 @@ export interface FakeReply {
   /** Pause this long after text chunk number `pauseAfterChunk` (1-based), then continue. */
   pauseAfterChunk?: number;
   pauseMs?: number;
+  /** During a pause or a stall, send an SSE comment line (": keep-alive") this often. */
+  keepAliveMs?: number;
+  /** The last chunk's finishReason (default STOP), or none at all (a cut-off stream). */
+  finishReason?: string;
+  noFinish?: boolean;
+  /**
+   * Google's continuation protocol: the first request sends this many text chunks, then a checkpoint
+   * (finishReason CONTINUATION + continuationToken) and ends; the SDK resumes with a NEW request carrying
+   * the token, which gets the rest after `resumeDelayMs`.
+   */
+  continueAfterChunks?: number;
+  resumeDelayMs?: number;
 }
 
 export interface FakeGemini {
@@ -229,10 +241,14 @@ export async function startFakeGemini(
     // Streaming: headers first (flushed immediately), then silence, then chunks.
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
     res.flushHeaders();
+    const finish = reply.noFinish ? {} : { finishReason: reply.finishReason ?? 'STOP' };
     const send = (parts: unknown[], last = false) =>
       res.write(
-        `data: ${JSON.stringify({ candidates: [{ content: { role: 'model', parts }, index: 0, ...(last ? { finishReason: 'STOP' } : {}) }], ...(last ? { usageMetadata: usage } : {}) })}\r\n\r\n`,
+        `data: ${JSON.stringify({ candidates: [{ content: { role: 'model', parts }, index: 0, ...(last ? finish : {}) }], ...(last ? { usageMetadata: usage } : {}) })}\r\n\r\n`,
       );
+    const keepAlive = () => res.write(': keep-alive\r\n\r\n');
+    const resumed = typeof fr.body?.continuationToken === 'string';
+    if (resumed && reply.resumeDelayMs) await wait(reply.resumeDelayMs);
     let elapsed = 0;
     if (reply.thoughtAfterMs !== undefined) {
       await wait(reply.thoughtAfterMs);
@@ -245,12 +261,37 @@ export async function startFakeGemini(
     const size = Math.ceil(text.length / 4);
     const pieces = text.match(new RegExp(`[\\s\\S]{1,${size}}`, 'g')) ?? [text];
     const upTo = Math.min(pieces.length, reply.stallAfterChunks ?? pieces.length);
-    for (let i = 0; i < upTo; i++) {
+    // Continuation: the first hop stops early with a checkpoint; the resumed hop sends the rest.
+    const from = resumed ? (reply.continueAfterChunks ?? 0) : 0;
+    const hopEnd =
+      !resumed && reply.continueAfterChunks !== undefined ? Math.min(upTo, reply.continueAfterChunks) : upTo;
+    for (let i = from; i < hopEnd; i++) {
       if (res.destroyed) return;
       send([{ text: pieces[i] }], i === pieces.length - 1);
-      if (reply.pauseMs && reply.pauseAfterChunk === i + 1) await wait(reply.pauseMs);
+      if (reply.pauseMs && reply.pauseAfterChunk === i + 1) {
+        if (!reply.keepAliveMs) await wait(reply.pauseMs);
+        else
+          for (let t = 0; t < reply.pauseMs && !res.destroyed; t += reply.keepAliveMs) {
+            await wait(reply.keepAliveMs);
+            if (!res.destroyed) keepAlive();
+          }
+      }
     }
-    if (upTo < pieces.length) return; // stalled: nothing more is sent, the connection stays open
+    if (!resumed && reply.continueAfterChunks !== undefined && hopEnd < pieces.length) {
+      res.write(
+        `data: ${JSON.stringify({ candidates: [{ content: { role: 'model', parts: [] }, index: 0, finishReason: 'CONTINUATION', continuationToken: 'tok-1' }] })}\r\n\r\n`,
+      );
+      res.end();
+      return;
+    }
+    if (upTo < pieces.length) {
+      // Stalled: no more chunks; the connection stays open (optionally kept alive with comments).
+      while (reply.keepAliveMs && !res.destroyed) {
+        await wait(reply.keepAliveMs);
+        if (!res.destroyed) keepAlive();
+      }
+      return;
+    }
     res.end();
   };
 

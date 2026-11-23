@@ -80,8 +80,11 @@ export interface PlanMilestoneEvent {
  * from an attempt that was abandoned and must be dropped. Always sent BEFORE the next model's first event.
  */
 export interface PlanResetEvent {
-  /** 'stalled': the model went silent mid-answer; 'unavailable': busy, over quota or not available. */
-  reason: 'stalled' | 'unavailable';
+  /**
+   * 'stalled': the model went silent mid-answer; 'incomplete': its answer was cut off (no finishReason
+   * STOP); 'unavailable': busy, over quota or not available.
+   */
+  reason: 'stalled' | 'incomplete' | 'unavailable';
   from: string;
   to: string;
 }

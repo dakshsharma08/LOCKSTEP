@@ -216,3 +216,27 @@ The owner's real-key run of `ba2deac` (their run, not mine): `gemini-3.8-flash` 
 - **E2E harness:** the Playwright mock now serves Gemini from a local HTTP server instead of MSW (MSW 3 + Node 22 crash when a mocked response body is aborted; reproduced in isolation). All earlier browser tests pass unchanged.
 - **NOT verified against real Gemini.**
 
+## 17. Transport investigation: SDK streaming vs raw REST vs non-streaming
+
+Goal: a reliable plan without lowering its quality. No real API calls were used (free-tier quota); everything below is measured with the real `@google/genai` 3.6.1 SDK against a local server that behaves like Google in each scenario, or read from the SDK source.
+
+| Scenario | SDK stream | Raw REST stream | Consequence |
+|---|---|---|---|
+| Events 1 s apart | delivered at 25 / 1022 / 2024 ms | 5 / 1006 / 2006 ms | no buffering in the SDK |
+| 3 s gap kept alive by SSE comments | nothing for 3 s | 3 comment reads | the SDK hides keep-alives; a live connection can look silent |
+| Server ends a hop with `CONTINUATION` + token | 2 HTTP requests, the reconnect shows as a pause | stream ends; resuming is our job | hidden extra requests; reconnects count against the gap limit |
+| Clean close, no `finishReason` | ends **without an error** | same | a cut-off answer looked complete (fixed) |
+| `finishReason: MAX_TOKENS` | yielded, no error | — | was ignored (fixed) |
+| Error event mid-stream | throws ApiError 503 | sees it | already mapped to a fallback |
+| Non-streaming | all data at the end | — | no progress; a stall is only detected at the total timeout |
+
+Also from the source: the SDK retries HTTP errors only when `httpOptions.retryOptions` is set (we don't), so there are no hidden SDK retries; automatic continuation is on by default and applies to the Gemini Developer API.
+
+Sizes (the app's own prompt builders): input ≈ 1,400 tokens; a rich plan (7 milestones × 5 tasks) ≈ 1,650 output tokens compact, ≈ 2,270 pretty-printed. 78 s for one plan on `gemini-3.5-flash` therefore means ~20–30 output tokens/s plus thinking: slow generation on Google's side (or long thinking), not the prompt.
+
+- **Confirmed:** SDK streaming is not the bottleneck and does not buffer; our code accepted cut-off answers; the SDK can add hidden requests and pauses (continuation) and hides keep-alive comments.
+- **Not confirmed (needs one real diagnostic run):** why `gemini-3.6-flash` went silent after 13 chunks: a thinking pause, a continuation reconnect, keep-alives during a live connection, or slow generation. The diagnostic now distinguishes all four (THINKING STALL / CONTINUATION / KEEP-ALIVES / STREAM STALL, plus SPEED).
+- **Changed:** answers are used only with `finishReason STOP` (cut-off → next model, `reset` reason `incomplete`, never validated or repaired); `ai_diag` logs `finishReason`, `hops` and prompt/output/thinking tokens; the diagnostic adds a wire probe and the four verdicts; an all-models failure says "busy" only when every model was busy.
+- **Tested:** cut-off (no finish, MAX_TOKENS) → next model with no repair; all cut off → honest message; continuation across 2 hops completes and is logged; a resume slower than the gap limit becomes a stall; diagnostic wire probe (requests, bytes, comments), CUT OFF, CONTINUATION, KEEP-ALIVES, SPEED. Mutation-checked.
+- **NOT verified against real Gemini.**
+

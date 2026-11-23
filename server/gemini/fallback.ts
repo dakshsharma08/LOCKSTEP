@@ -14,8 +14,9 @@
  *     drops out by itself. GEMINI_MODEL_FALLBACKS overrides it.
  *   • Hard cap on upstream calls per plan: 1 + primaryRetries + fallbacks (default 4 calls in total).
  *     503s also count against rate limits, so hammering a struggling API makes things worse.
- *   • A model that STALLS mid-answer (no chunk within the limit, or its own stream time used up) is
- *     abandoned and the next model starts from scratch; the browser is told to drop the partial output.
+ *   • A model that STALLS mid-answer (no chunk within the limit, or its own stream time used up), or whose
+ *     answer is CUT OFF (no finishReason STOP), is abandoned and the next model starts from scratch; the
+ *     browser is told to drop the partial output.
  *   • An alternative that is itself temporarily unavailable, or not available to this key (404), is
  *     skipped. Any OTHER error from an alternative (a 400 such as "schema has too many states", a 403…)
  *     stops the chain and is reported as it is, with the earlier attempts listed: trying yet another
@@ -23,6 +24,7 @@
  */
 import { AppError } from '../lib/errors';
 import { redactSecrets } from '../lib/redact';
+import { isIncompleteAnswerError } from './call';
 
 /** Model ids go into URL paths, so only plain names are accepted. */
 export const MODEL_NAME = /^[a-z0-9][a-z0-9._-]{2,62}$/;
@@ -200,9 +202,13 @@ function why(err: unknown): string {
 }
 
 function totalFailure(tried: { model: string; error: unknown }[]): AppError {
+  // Say what really happened: "busy" only when every model was busy / over quota / unreachable.
+  const allBusy = tried.every((t) => isTemporaryUnavailable(t.error));
   return new AppError(
     'AI_BUSY',
-    `Gemini is very busy right now (${tried.length} models tried). Your saved plan still works. Try again in a minute, or build the plan yourself.`,
+    allBusy
+      ? `Gemini is very busy right now (${tried.length} models tried). Your saved plan still works. Try again in a minute, or build the plan yourself.`
+      : `Gemini couldn't finish the plan: every model was busy, stopped mid-answer or was cut off (${tried.length} models tried). Your saved plan still works. Try again in a minute, or build the plan yourself.`,
     { details: tried.map((t) => `${t.model}: ${why(t.error)}`), retryable: true },
   );
 }
@@ -282,6 +288,7 @@ export async function runWithFallback<T>(
       const movesOn =
         isTemporaryUnavailable(err) ||
         isStreamStall(err) ||
+        isIncompleteAnswerError(err) ||
         (model !== pool.primary && isModelUnavailable(err));
       if (!movesOn) throw model === pool.primary ? err : stoppedAt(err, model, tried);
       tried.push({ model, error: err });

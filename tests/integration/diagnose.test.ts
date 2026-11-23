@@ -359,3 +359,68 @@ describe('diagnose: uses the same settings as the app, and shows how a stream st
     expect(report.verdict.join('\n')).toMatch(/LONG PAUSE on gemini-3\.5-flash: it finished, but paused/);
   });
 });
+
+describe('diagnose: what the SDK hides (wire probe), cut-off answers and speed', () => {
+  const REAL = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash'];
+  const quota = {
+    error: { status: 429, code: 'RESOURCE_EXHAUSTED', message: 'You exceeded your current quota. limit: 20' },
+  };
+  const onAlt = (m: string, reply: FakeReply) => (r: FakeRequest) =>
+    r.model === 'gemini-3.8-flash' ? quota : planStream(r) && r.model === m ? reply : undefined;
+  const altTiming = (report: Awaited<ReturnType<typeof diagnose>>['report'], m: string) =>
+    report.planAlternatives.find((p) => p.model === m)!.timing;
+
+  it('a normal plan request: finish STOP, token counts, speed, and what came over the wire', async () => {
+    const { report, text } = await diagnose(onAlt('none', {}), { skipFlow: true }, REAL);
+    const t = altTiming(report, 'gemini-3.5-flash');
+
+    expect(t).toMatchObject({ ok: true, finishReason: 'STOP', outputTokens: 20, promptTokens: 10 });
+    expect(t.wire).toMatchObject({ requests: 1, commentLines: 0 });
+    expect(t.wire!.bytes).toBeGreaterThan(500);
+    expect(text).toMatch(
+      /plan request on gemini-3\.5-flash +OK .*finish STOP · 20 output tokens.*wire: 1 request\(s\)/,
+    );
+    expect(report.verdict.join('\n')).toMatch(/SPEED on gemini-3\.5-flash: first text at/);
+  });
+
+  it('an answer that ends without STOP: CUT OFF', async () => {
+    const { report } = await diagnose(
+      onAlt('gemini-3.5-flash', { noFinish: true }),
+      { skipFlow: true },
+      REAL,
+    );
+    expect(altTiming(report, 'gemini-3.5-flash').finishReason).toBeUndefined();
+    expect(report.verdict.join('\n')).toMatch(
+      /CUT OFF on gemini-3\.5-flash: the answer ended without a finish reason/,
+    );
+  });
+
+  it('Google splits the answer: CONTINUATION, with the extra request counted', async () => {
+    const { report } = await diagnose(
+      onAlt('gemini-3.5-flash', { continueAfterChunks: 2, resumeDelayMs: 50 }),
+      { skipFlow: true },
+      REAL,
+    );
+    const t = altTiming(report, 'gemini-3.5-flash');
+    expect(t).toMatchObject({ ok: true, hops: 1, finishReason: 'STOP' });
+    expect(t.wire?.requests).toBe(2);
+    expect(report.verdict.join('\n')).toMatch(
+      /CONTINUATION on gemini-3\.5-flash: Google split the answer into 2 requests/,
+    );
+  });
+
+  it('a "stall" during which the connection kept sending SSE comments: KEEP-ALIVES, a live connection', async () => {
+    const { report } = await diagnose(
+      onAlt('gemini-3.6-flash', { stallAfterChunks: 2, keepAliveMs: 80 }),
+      { skipFlow: true, planTimeoutMs: 1500 },
+      REAL,
+    );
+    const t = altTiming(report, 'gemini-3.6-flash');
+    expect(t).toMatchObject({ ok: false, stalledIn: 'streaming', chunks: 2 });
+    expect(t.wire!.commentLines).toBeGreaterThan(5);
+    expect(t.wire!.lastByteMs!).toBeGreaterThan(t.lastChunkMs! + 1000);
+    expect(report.verdict.join('\n')).toMatch(
+      /KEEP-ALIVES on gemini-3\.6-flash: \d+ SSE comment line\(s\) arrived that the SDK hides; the connection was still sending/,
+    );
+  });
+});

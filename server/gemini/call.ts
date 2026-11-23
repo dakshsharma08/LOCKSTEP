@@ -186,6 +186,14 @@ interface Phases {
   /** When the last chunk arrived, and the longest silence between two chunks (ms). */
   lastChunkMs?: number;
   maxGapMs?: number;
+  /** The last finishReason Google sent (a complete answer ends with STOP). */
+  finishReason?: string;
+  /**
+   * Continuation checkpoints seen. For long answers Google can end a "hop" with a continuationToken and the
+   * SDK then opens ANOTHER request to resume (automatic continuation, on by default in @google/genai 3.x).
+   * Each hop is a separate request, and the reconnect shows up here as a pause between chunks.
+   */
+  hops: number;
 }
 
 type StallPhase = 'waiting-for-http-response' | 'waiting-for-first-chunk' | 'streaming';
@@ -195,6 +203,47 @@ const stallPhase = (ph: Phases): StallPhase =>
     : ph.firstChunkMs === undefined
       ? 'waiting-for-first-chunk'
       : 'streaming';
+
+/**
+ * The stream ended, but not with finishReason STOP: the answer is cut off. Not the user's fault and not
+ * provably the model's either, so it is reported as such ("phase: incomplete-answer") and gemini/fallback.ts
+ * may start over on another model.
+ */
+function incompleteAnswer(ph: Phases): AppError {
+  const why =
+    ph.finishReason === undefined
+      ? 'the stream ended without a finish reason (cut off)'
+      : ph.finishReason === 'MAX_TOKENS'
+        ? 'finishReason MAX_TOKENS (the output limit was reached)'
+        : `finishReason ${ph.finishReason}`;
+  return new AppError(
+    'INTERNAL',
+    "Gemini stopped before finishing the plan, so it wasn't used. Your saved plan still works. Please try again.",
+    {
+      retryable: true,
+      details: [
+        `Incomplete answer: ${why}`,
+        `phase: incomplete-answer (${ph.chunks} chunks: ${ph.thoughtChunks} thinking, ${ph.textChunks} text)`,
+      ],
+    },
+  );
+}
+
+/** Is this the "answer was cut off" error from streamGemini? */
+export function isIncompleteAnswerError(err: unknown): boolean {
+  return err instanceof AppError && (err.details ?? []).some((d) => d.startsWith('phase: incomplete-answer'));
+}
+
+/** Token counts by kind (prompt / visible output / thinking), when Google reported them. */
+function usageBreakdown(r: GenerateContentResponse | undefined): Record<string, number> {
+  const u = r?.usageMetadata;
+  if (!u) return {};
+  const out: Record<string, number> = {};
+  if (typeof u.promptTokenCount === 'number') out.promptTokens = u.promptTokenCount;
+  if (typeof u.candidatesTokenCount === 'number') out.outputTokens = u.candidatesTokenCount;
+  if (typeof u.thoughtsTokenCount === 'number') out.thoughtsTokens = u.thoughtsTokenCount;
+  return out;
+}
 
 /** A TIMEOUT that says which phase it hit ("phase: streaming (…)", "phase: waiting-for-first-chunk (…)"). */
 function stageTimeout(what: string, phase: string): AppError {
@@ -254,7 +303,7 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
 
   let started = Date.now();
   let attempts = 0;
-  let ph: Phases = { chunks: 0, thoughtChunks: 0, textChunks: 0 };
+  let ph: Phases = { chunks: 0, thoughtChunks: 0, textChunks: 0, hops: 0 };
   let lastUsage: GenerateContentResponse | undefined;
   let text = '';
   let attemptSignal: AbortSignal = total;
@@ -266,7 +315,10 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
     if (ph.lastChunkMs !== undefined) ph.maxGapMs = Math.max(ph.maxGapMs ?? 0, at - ph.lastChunkMs);
     ph.lastChunkMs = at;
     ph.chunks++;
-    if (chunk.candidates?.[0]?.content?.parts?.some((p) => p.thought)) ph.thoughtChunks++;
+    const cand = chunk.candidates?.[0];
+    if (cand?.content?.parts?.some((p) => p.thought)) ph.thoughtChunks++;
+    if (cand?.finishReason !== undefined) ph.finishReason = String(cand.finishReason);
+    if (cand?.continuationToken) ph.hops++;
     if (chunk.usageMetadata) lastUsage = chunk;
     blocked = blockReason(chunk) ?? blocked;
     const delta = responseText(chunk);
@@ -292,6 +344,9 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
       chunks: ph.chunks,
       thoughtChunks: ph.thoughtChunks,
       textChunks: ph.textChunks,
+      ...(ph.finishReason !== undefined ? { finishReason: ph.finishReason } : {}),
+      ...(ph.hops > 0 ? { hops: ph.hops } : {}),
+      ...usageBreakdown(lastUsage),
       ...(ph.lastChunkMs !== undefined ? { lastChunkMs: ph.lastChunkMs } : {}),
       ...(ph.maxGapMs !== undefined ? { maxGapMs: ph.maxGapMs } : {}),
       totalMs: Date.now() - started,
@@ -305,7 +360,7 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
       async () => {
         started = Date.now();
         attempts++;
-        ph = { chunks: 0, thoughtChunks: 0, textChunks: 0 };
+        ph = { chunks: 0, thoughtChunks: 0, textChunks: 0, hops: 0 };
         const attemptCtrl = new AbortController();
         attemptSignal = AbortSignal.any([total, attemptCtrl.signal]);
         const firstTimer = setTimeout(
@@ -374,9 +429,20 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
       stream?.return(undefined).catch(() => {});
       throw err;
     }
+    if (blocked) {
+      record(ctx, runMeta(args.kind, args.model, started, true, tokensOf(lastUsage)));
+      diag(true, { phase: 'done', tokens: tokensOf(lastUsage) });
+      throw blockedError(blocked);
+    }
+    // A COMPLETE answer ends with finishReason STOP. Without it the text is cut off (the output limit was
+    // hit, or the stream closed early: the SDK ends such a stream without an error). Never pass a cut-off
+    // answer on to validation or repair: report it, and let the caller try another model.
+    if (ph.finishReason !== 'STOP') {
+      record(ctx, runMeta(args.kind, args.model, started, false, tokensOf(lastUsage)));
+      throw incompleteAnswer(ph);
+    }
     record(ctx, runMeta(args.kind, args.model, started, true, tokensOf(lastUsage)));
     diag(true, { phase: 'done', tokens: tokensOf(lastUsage) });
-    if (blocked) throw blockedError(blocked);
     return text;
   } catch (err) {
     // attemptSignal carries our abort reason (TIMEOUT / CANCELLED) if we pressed stop.
@@ -384,8 +450,13 @@ export async function streamGemini(ctx: CallContext, args: StreamArgs): Promise<
     const status = googleStatus(err);
     if (!(mapped.code === 'INVALID_INPUT' && ph.chunks > 0)) {
       diag(false, {
-        phase:
-          status !== undefined ? 'http-error' : mapped.code === 'CANCELLED' ? 'cancelled' : stallPhase(ph),
+        phase: isIncompleteAnswerError(mapped)
+          ? 'incomplete-answer'
+          : status !== undefined
+            ? 'http-error'
+            : mapped.code === 'CANCELLED'
+              ? 'cancelled'
+              : stallPhase(ph),
         ...failureInfo(err instanceof AppError ? err : (err as unknown)),
         ...(mapped.code === 'TIMEOUT' ? { error: 'TIMEOUT' } : {}),
       });

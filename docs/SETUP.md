@@ -57,6 +57,10 @@ The diagnostic uses the same `GEMINI_MODEL_FALLBACKS` and `GEMINI_THINKING_LEVEL
 | `REQUEST REJECTED` | Google answered HTTP 400 for the plan request; the exact reason is printed. | That reason names the offending field. |
 | `SCHEMA TOO COMPLEX` | Google rejected the plan's response schema (HTTP 400 "too many states"). Another model will not help. | A bug in this app's request: report it with the printed reason. |
 | `STREAM STALL` / `THINKING STALL` | A model accepted the plan request, sent some chunks, then went silent. The line shows how many chunks were thinking vs plan text, and for how long it was silent. | THINKING STALL: try `GEMINI_THINKING_LEVEL=minimal`. STREAM STALL: Google-side; put another model first with `GEMINI_MODEL_FALLBACKS`. |
+| `CUT OFF` | The answer ended without `finishReason STOP` (output limit, or the stream closed early). The app never uses such an answer; it starts over on the next model. | Report it with the printed token counts. |
+| `CONTINUATION` | Google split a long answer into several requests; the SDK resumed automatically. Each resume is a pause and an extra request against the quota. | Informational. If its pauses are long, they show up as stalls. |
+| `KEEP-ALIVES` | The connection carried SSE comment lines the SDK hides; with "the connection was still sending" a reported stall was a live connection. | Report it: the app's gap timer would then need to count bytes, not chunks. |
+| `SPEED` | First text time, output tokens, tokens/s and thinking tokens for a plan request. | Informational: tells slow thinking from slow writing. |
 | `LONG PAUSE` | The request finished, but paused longer between two chunks than the app allows (30 s). | Same as STREAM STALL. |
 | `QUOTA / RATE LIMIT` | Google answered HTTP 429 for your model (for example the free-tier daily limit). | Planning falls back to the alternatives automatically; the quota resets later. |
 | `PLAN SCHEMA OK on <model>` | That alternative accepted the real plan request (prompt + schema). | Nothing to do. |

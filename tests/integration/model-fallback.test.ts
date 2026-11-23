@@ -790,3 +790,104 @@ describe('stall after partial output → reset → next model', () => {
     expect(streams()).toEqual([PRIMARY]);
   });
 });
+
+// ─── Transport hardening: a COMPLETE answer ends with finishReason STOP; Google's continuation hops ───
+
+describe('a cut-off answer is never used', () => {
+  it('no finishReason (stream closed early): reset "incomplete" → next model; never validated or repaired', async () => {
+    const base = await start((r) => (r.stream && r.model === PRIMARY ? { noFinish: true } : undefined));
+    const events = await plan(base);
+
+    expect(events.at(-1)?.event).toBe('result');
+    expect(streams()).toEqual([PRIMARY, 'gemini-3.5-flash']);
+    expect(events.find((e) => e.event === 'reset')?.data).toEqual({
+      reason: 'incomplete',
+      from: PRIMARY,
+      to: 'gemini-3.5-flash',
+    });
+    expect(
+      events.find(
+        (e) => e.event === 'status' && /stopped before finishing\. Starting over/.test(e.data.message),
+      ),
+    ).toBeTruthy();
+    expect(repairs()).toHaveLength(0);
+    const cut = diag().find((d) => d.kind === 'plan' && d.phase === 'incomplete-answer')!;
+    expect(cut).toMatchObject({ model: PRIMARY, ok: false });
+    expect(cut.finishReason).toBeUndefined();
+  });
+
+  it('finishReason MAX_TOKENS: the same, and the log says why', async () => {
+    const base = await start((r) =>
+      r.stream && r.model === PRIMARY ? { finishReason: 'MAX_TOKENS' } : undefined,
+    );
+    const events = await plan(base);
+
+    expect(events.at(-1)?.event).toBe('result');
+    const cut = diag().find((d) => d.kind === 'plan' && d.phase === 'incomplete-answer')!;
+    expect(cut.finishReason).toBe('MAX_TOKENS');
+    const fb = diag().find((d) => d.event === 'model_fallback')!;
+    expect(fb).toMatchObject({ incomplete: true, stalled: false });
+    expect(fb.reason).toMatch(/Incomplete answer: finishReason MAX_TOKENS \(the output limit was reached\)/);
+    expect(repairs()).toHaveLength(0);
+  });
+
+  it('every model cut off: an honest message (not "very busy"), 3 calls', async () => {
+    const base = await start((r) => (r.stream ? { noFinish: true } : undefined));
+    const err = (await plan(base)).at(-1)!;
+
+    expect(err.event).toBe('error');
+    expect(err.data.message).toMatch(
+      /couldn't finish the plan: every model was busy, stopped mid-answer or was cut off \(3 models tried\)/,
+    );
+    expect(
+      err.data.details.every((d: string) =>
+        /Incomplete answer: the stream ended without a finish reason/.test(d),
+      ),
+    ).toBe(true);
+    expect(streams()).toHaveLength(3);
+  });
+
+  it('the completed run logs finishReason STOP and the token breakdown', async () => {
+    const base = await start(() => undefined);
+    expect((await plan(base)).at(-1)?.event).toBe('result');
+    const done = diag().find((d) => d.kind === 'plan' && d.phase === 'done')!;
+    expect(done).toMatchObject({
+      finishReason: 'STOP',
+      promptTokens: 10,
+      outputTokens: 20,
+      thoughtsTokens: 0,
+    });
+  });
+});
+
+describe("Google's continuation protocol (SDK automatic continuation)", () => {
+  it('a long answer split into 2 hops completes normally; the hidden extra request is logged (hops: 1)', async () => {
+    const base = await start((r) =>
+      r.stream && r.model === PRIMARY ? { continueAfterChunks: 2, resumeDelayMs: 50 } : undefined,
+    );
+    const events = await plan(base);
+
+    expect(events.at(-1)?.event).toBe('result');
+    const hops = fake!.requests.filter((r) => r.stream && r.model === PRIMARY);
+    expect(hops).toHaveLength(2); // one call from the app, one resume request from the SDK
+    expect(hops[1]!.body?.continuationToken).toBe('tok-1');
+    expect(diag().find((d) => d.kind === 'plan' && d.phase === 'done')).toMatchObject({
+      hops: 1,
+      finishReason: 'STOP',
+    });
+    expect(events.some((e) => e.event === 'reset')).toBe(false);
+  });
+
+  it('a resume that takes longer than the gap limit counts as a stall (documents the trade-off)', async () => {
+    const base = await start(
+      (r) => (r.stream && r.model === PRIMARY ? { continueAfterChunks: 2, resumeDelayMs: 500 } : undefined),
+      {},
+      { chunkIdleTimeoutMs: 200 },
+    );
+    const events = await plan(base);
+
+    expect(events.at(-1)?.event).toBe('result');
+    expect(events.find((e) => e.event === 'reset')?.data.reason).toBe('stalled');
+    expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-3.5-flash');
+  });
+});
