@@ -15,9 +15,12 @@
 import { spawn, execSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, copyFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
-const root = new URL('..', import.meta.url).pathname;
+// fileURLToPath, not .pathname: on Windows .pathname is "/C:/…", which breaks every path below.
+const root = fileURLToPath(new URL('..', import.meta.url));
+const isWindows = process.platform === 'win32';
 const out = join(root, 'submission');
 mkdirSync(out, { recursive: true });
 const args = process.argv.slice(2);
@@ -58,11 +61,13 @@ async function main() {
     execSync('npm run build', { cwd: root, stdio: 'inherit' });
   }
   console.log(`› starting app on ${base}`);
+  // On Windows npx is npx.cmd, which Node only starts through a shell.
   const server = spawn('npx', ['tsx', 'server/prod.ts'], {
     cwd: root,
     env: { ...process.env, PORT: String(port), NODE_ENV: 'production', ALLOWED_ORIGINS: base },
     stdio: ['ignore', 'pipe', 'pipe'],
-    detached: true,
+    detached: !isWindows,
+    shell: isWindows,
   });
   server.stderr.on('data', (d) => process.stderr.write(`[server] ${d}`));
   try {
@@ -107,7 +112,21 @@ async function main() {
 
     if (aiMode) {
       await page.getByRole('button', { name: 'Plan with Gemini' }).click();
-      await page.waitForURL(/\/review$/, { timeout: 180_000 });
+      // The app's own limit for one plan is 270 s (all models + repair), so wait a little longer than that.
+      // If planning fails, print the app's error and stop: nothing in submission/ is overwritten.
+      const alert = page.getByRole('alert').first();
+      // The losing wait is abandoned; swallow its later rejection (e.g. when the browser closes).
+      const quiet = (p) => p.catch(() => 'timeout');
+      const outcome = await Promise.race([
+        quiet(page.waitForURL(/\/review$/, { timeout: 290_000 }).then(() => 'plan')),
+        quiet(alert.waitFor({ timeout: 290_000 }).then(() => 'error')),
+      ]);
+      if (outcome === 'timeout')
+        throw new Error('No plan and no error after 290 s (no assets were changed).');
+      if (outcome === 'error') {
+        const text = (await alert.innerText()).replace(/\s+/g, ' ').trim();
+        throw new Error(`Gemini planning failed in the app (no assets were changed): ${text}`);
+      }
     } else {
       await page.getByRole('button', { name: /Build my plan/ }).click();
       await page.waitForURL(/\/review$/);
@@ -314,9 +333,10 @@ npm run submission -- --url https://<your-live-url>
     console.log(`› mode: ${run.mode}`);
     if (checks.some((c) => !c.ok) || chars > 480) process.exitCode = 1;
   } finally {
-    // Kill the whole process group (npx → tsx → node), or the server would outlive the script.
+    // Kill the whole process tree (npx → tsx → node), or the server would outlive the script.
     try {
-      process.kill(-server.pid, 'SIGTERM');
+      if (isWindows) execSync(`taskkill /pid ${server.pid} /T /F`, { stdio: 'ignore' });
+      else process.kill(-server.pid, 'SIGTERM');
     } catch {
       server.kill('SIGTERM');
     }
