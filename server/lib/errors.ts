@@ -115,6 +115,12 @@ function isAbortError(err: unknown): boolean {
 }
 
 /**
+ * Google's wording when a response schema is too complex ("The specified schema produces a constraint
+ * that has too many states for serving…") or otherwise unusable as a response schema.
+ */
+export const SCHEMA_REJECTION = /too many states|specified schema|response_?(json_?)?schema/i;
+
+/**
  * Turn anything that was thrown into an AppError.
  *
  * `signal` is the AbortSignal of the call. When WE aborted (timeout or client
@@ -151,6 +157,18 @@ export function toAppError(err: unknown, signal?: AbortSignal): AppError {
         retryable: false,
         details: why('Gemini status 404 — check GEMINI_MODEL'),
       });
+    }
+    if (status === 400 && SCHEMA_REJECTION.test(reason ?? raw)) {
+      // Not the user's input and not a busy Gemini: the response schema WE sent is too complex for this
+      // model. Permanent for this request, so it is never retried on another model (gemini/fallback.ts).
+      return new AppError(
+        'INTERNAL',
+        "Gemini rejected LOCKSTEP's plan format (HTTP 400: the response schema is too complex for this model). This is a problem on our side, not in your answers. Your saved plan still works.",
+        {
+          retryable: false,
+          details: [...why(), 'Cause: response schema rejected by Gemini (not a temporary error).'],
+        },
+      );
     }
     if (status === 400) {
       return new AppError(

@@ -18,7 +18,7 @@ import { GoogleGenAI, type GenerateContentConfig, type ThinkingConfig } from '@g
 import type { AddressInfo } from 'node:net';
 import type { ApiError, PlanStreamEvent } from '../../shared/api';
 import { createApp } from '../app';
-import { upstreamStatus } from '../lib/errors';
+import { SCHEMA_REJECTION, upstreamStatus } from '../lib/errors';
 import { redactSecrets, registerSecrets, upstreamReason } from '../lib/redact';
 import { partsText } from './call';
 import { pickNewestStableFlash } from './client';
@@ -103,6 +103,8 @@ export interface DiagReport {
   chainSource: 'auto' | 'GEMINI_MODEL_FALLBACKS' | 'disabled';
   /** Real minimal request to each alternative the app would fall back to. */
   alternatives: { model: string; timing: StreamTiming }[];
+  /** The REAL plan request (prompt + response schema) sent to each alternative: does it accept the schema? */
+  planAlternatives: { model: string; timing: StreamTiming }[];
   flow: null | {
     ok: boolean;
     ms: number;
@@ -355,6 +357,7 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
     minimal: [],
     modelsListed: [],
     chainSource: 'auto',
+    planAlternatives: [],
     alternatives: [],
     plan: [],
     flow: null,
@@ -467,7 +470,7 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
       capacity: job.capacity,
       allowedDates: job.allowedDates,
     });
-    const schema = buildPlanJsonSchema(job.allowedDates);
+    const schema = buildPlanJsonSchema();
     const auto = planThinkingConfig(report.model, 'auto');
     type Variant = { variant: 'A' | 'B' | 'C'; label: string; thinking: ThinkingConfig | null };
     const variants: Variant[] = [
@@ -482,24 +485,37 @@ export async function runDiagnostics(o: DiagOptions): Promise<DiagReport> {
       (v, i, all) => all.findIndex((w) => JSON.stringify(w.thinking) === JSON.stringify(v.thinking)) === i,
     );
     const ai = mk(o.apiVersion);
+    const planRequest = (thinking: ThinkingConfig | null | undefined) => ({
+      contents: [{ role: 'user' as const, parts: buildPlanUserParts(job.intake) }],
+      config: {
+        systemInstruction: system,
+        responseMimeType: 'application/json',
+        responseJsonSchema: schema,
+        ...(thinking ? { thinkingConfig: thinking } : {}),
+      },
+    });
     for (const v of variants) {
+      const timing = await timeStream(ai, report.model, planRequest(v.thinking), planCap, true);
+      report.plan.push({ ...v, timing });
+      say(`  ${v.variant} ${v.label}\n    ${timing.ok ? 'OK ' : 'FAIL'} ${timingLine(timing)}`);
+      if (timing.status === 429 || timing.status === 503) {
+        // Busy or out of quota: other thinking settings would fail the same way and only use up quota.
+        say(`  (other thinking settings skipped: ${report.model} answered HTTP ${timing.status})`);
+        break;
+      }
+    }
+    // The same plan request (the app's real settings) to each alternative: does that model accept the
+    // response schema? This is exactly what the app sends after falling back.
+    for (const model of chain) {
       const timing = await timeStream(
         ai,
-        report.model,
-        {
-          contents: [{ role: 'user', parts: buildPlanUserParts(job.intake) }],
-          config: {
-            systemInstruction: system,
-            responseMimeType: 'application/json',
-            responseJsonSchema: schema,
-            ...(v.thinking ? { thinkingConfig: v.thinking } : {}),
-          },
-        },
+        model,
+        planRequest(planThinkingConfig(model, 'auto')),
         planCap,
         true,
       );
-      report.plan.push({ ...v, timing });
-      say(`  ${v.variant} ${v.label}\n    ${timing.ok ? 'OK ' : 'FAIL'} ${timingLine(timing)}`);
+      report.planAlternatives.push({ model, timing });
+      say(`  plan request on ${model.padEnd(18)} ${timing.ok ? 'OK ' : 'FAIL'} ${timingLine(timing)}`);
     }
   }
 
@@ -716,7 +732,9 @@ export function diagnose(r: DiagReport, firstChunkLimitMs = 30_000): string[] {
     );
   } else if (r.plan.length && r.plan.every((p) => slow(p.timing)) && r.minimal.every((m) => m.timing.ok)) {
     const rejected = r.plan.find((p) => p.timing.status === 400);
-    if (rejected)
+    if (rejected && SCHEMA_REJECTION.test(rejected.timing.reason ?? '')) {
+      // Reported once, below, as SCHEMA TOO COMPLEX.
+    } else if (rejected)
       out.push(
         `REQUEST REJECTED: Google answered HTTP 400 for the plan request: ${rejected.timing.reason ?? 'no reason given'}. This is the plan schema/prompt, not timing.`,
       );
@@ -726,18 +744,37 @@ export function diagnose(r: DiagReport, firstChunkLimitMs = 30_000): string[] {
       );
   }
 
-  // Google answered 503: temporary capacity trouble on ITS side. Say so, and say whether the fallback chain works.
+  // The response schema itself rejected ("too many states"): a problem in this app's request, on any model.
+  const schemaRejected = [
+    ...r.plan.map((p) => ({ model: r.model, t: p.timing })),
+    ...r.planAlternatives.map((p) => ({ model: p.model, t: p.timing })),
+  ].filter((x) => x.t.status === 400 && SCHEMA_REJECTION.test(x.t.reason ?? ''));
+  if (schemaRejected.length) {
+    out.push(
+      `SCHEMA TOO COMPLEX: Google rejected the plan's response schema (HTTP 400) on ${[...new Set(schemaRejected.map((x) => x.model))].join(', ')}: ${schemaRejected[0]!.t.reason}. This is this app's request, not your key or Google's capacity; another model will not help.`,
+    );
+  }
+  for (const p of r.planAlternatives.filter((x) => x.timing.ok)) {
+    out.push(
+      `PLAN SCHEMA OK on ${p.model}: the real plan request was accepted and answered in ${sec(p.timing.totalMs)}${p.timing.jsonOk === false ? ' (but the JSON did not parse)' : ''}.`,
+    );
+  }
+
+  // Google answered 503 (capacity) or 429 (quota / rate limit): temporary trouble that another model can
+  // get around. Say so, and say whether the fallback chain works.
   const all503 = [...r.minimal.map((m) => m.timing), ...r.plan.map((p) => p.timing)].find(
-    (t) => t.status === 503,
+    (t) => t.status === 503 || t.status === 429,
   );
   if (all503) {
     out.push(
-      `OVERLOADED: Google answered HTTP 503 for ${r.model} (${all503.reason ?? 'UNAVAILABLE'}). That is temporary capacity trouble on Google's side, not your key, your network or this app.`,
+      all503.status === 429
+        ? `QUOTA / RATE LIMIT: Google answered HTTP 429 for ${r.model} (${all503.reason ?? 'RESOURCE_EXHAUSTED'}). Your key's quota for this model is used up for now (free-tier limits are per model), not a bug in this app.`
+        : `OVERLOADED: Google answered HTTP 503 for ${r.model} (${all503.reason ?? 'UNAVAILABLE'}). That is temporary capacity trouble on Google's side, not your key, your network or this app.`,
     );
     const working = r.alternatives.find((a) => a.timing.ok);
     if (working) {
       out.push(
-        `FALLBACK READY: ${working.model} answered in ${sec(working.timing.totalMs)} while ${r.model} was unavailable. The app switches to it automatically (after one retry on ${r.model}).`,
+        `FALLBACK READY: ${working.model} answered in ${sec(working.timing.totalMs)} while ${r.model} was unavailable. The app switches to it automatically (after one retry on ${r.model})${r.planAlternatives.length && !r.planAlternatives.find((p) => p.model === working.model)?.timing.ok ? ', but see the plan-request result for it above' : ''}.`,
       );
     } else if (r.alternatives.length > 0) {
       out.push(

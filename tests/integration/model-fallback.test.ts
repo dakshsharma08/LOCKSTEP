@@ -13,7 +13,14 @@ import { GoogleGenAI } from '@google/genai';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { createApp } from '../../server/app';
-import { startFakeGemini, type FakeGemini, type FakeReply, type FakeRequest } from '../helpers/fakeGemini';
+import {
+  TOO_MANY_STATES,
+  heavySchemaReason,
+  startFakeGemini,
+  type FakeGemini,
+  type FakeReply,
+  type FakeRequest,
+} from '../helpers/fakeGemini';
 
 // Built at runtime: a key-shaped literal in source could trip GitHub secret scanning.
 const KEY = `${['AI', 'za'].join('')}SyFAKE-fallback-key-0123456789abcdef`;
@@ -313,5 +320,127 @@ describe('what must NOT fall back', () => {
     expect(err.data.code).toBe('AI_NOT_CONFIGURED');
     expect(streams()).toEqual([PRIMARY]);
     expect(JSON.stringify(err) + logs.join('\n')).not.toContain(KEY);
+  });
+});
+
+// ─── The owner's real-key results (2026-11-23): primary over quota, alternatives reject the old schema ───
+
+const QUOTA: FakeReply = {
+  error: {
+    status: 429,
+    code: 'RESOURCE_EXHAUSTED',
+    message:
+      'You exceeded your current quota. Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3.8-flash',
+  },
+};
+const SCHEMA_400: FakeReply = { error: { status: 400, code: 'INVALID_ARGUMENT', message: TOO_MANY_STATES } };
+
+describe('response schema compatibility (the fake rejects state-heavy schemas, like Google)', () => {
+  it('primary over quota (429) → gemini-3.6-flash ACCEPTS the plan schema → a validated plan', async () => {
+    const base = await start((r) => (r.stream && r.model === PRIMARY ? QUOTA : undefined));
+    const events = await plan(base);
+
+    expect(events.at(-1)?.event).toBe('result');
+    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.6-flash']);
+    const sent = fake!.requests.find((r) => r.stream && r.model === 'gemini-3.6-flash')!;
+    expect(heavySchemaReason(sent.body?.generationConfig?.responseJsonSchema)).toBeNull();
+    expect(events.at(-1)!.data.runs.at(-1)).toMatchObject({ model: 'gemini-3.6-flash', ok: true });
+    // The plan really passed the server's own checks: dates from the allowed list, chronological, in capacity.
+    expect(events.filter((e) => e.event === 'milestone').length).toBeGreaterThan(0);
+  });
+
+  it('gemini-3.5-flash gets the SAME accepted schema when 3.6 is busy', async () => {
+    const base = await start((r) =>
+      r.stream && r.model === PRIMARY
+        ? QUOTA
+        : r.stream && r.model === 'gemini-3.6-flash'
+          ? OVERLOADED
+          : undefined,
+    );
+    const events = await plan(base);
+
+    expect(events.at(-1)?.event).toBe('result');
+    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.6-flash', 'gemini-3.5-flash']);
+    const schemaFor = (m: string) =>
+      fake!.requests.find((r) => r.stream && r.model === m)!.body?.generationConfig?.responseJsonSchema;
+    expect(schemaFor('gemini-3.5-flash')).toEqual(schemaFor('gemini-3.6-flash'));
+    expect(schemaFor('gemini-3.5-flash')).toEqual(schemaFor(PRIMARY));
+    expect(heavySchemaReason(schemaFor('gemini-3.5-flash'))).toBeNull();
+    expect(events.at(-1)!.data.runs.at(-1).model).toBe('gemini-3.5-flash');
+  });
+
+  it('every plan request the app sends passes the fake schema check (no 400 anywhere in a normal run)', async () => {
+    const base = await start(() => undefined);
+    expect((await plan(base)).at(-1)?.event).toBe('result');
+    const planReqs = fake!.requests.filter((r) => r.body?.generationConfig?.responseJsonSchema);
+    expect(planReqs.length).toBeGreaterThan(0);
+    for (const r of planReqs)
+      expect(heavySchemaReason(r.body!.generationConfig.responseJsonSchema)).toBeNull();
+  });
+});
+
+describe('HTTP 400 schema rejection: accurate error, no model fallback', () => {
+  it('429 on the primary, then 400 "too many states" on 3.6: the 400 is reported, 3.5 is never called', async () => {
+    const base = await start((r) =>
+      r.stream && r.model === PRIMARY
+        ? QUOTA
+        : r.stream && r.model === 'gemini-3.6-flash'
+          ? SCHEMA_400
+          : undefined,
+    );
+    const err = (await plan(base)).at(-1)!;
+
+    expect(err.event).toBe('error');
+    expect(err.data.code).not.toBe('AI_BUSY');
+    expect(err.data.code).toBe('INTERNAL');
+    expect(err.data.retryable).toBe(false);
+    expect(err.data.message).toMatch(
+      /rejected LOCKSTEP's plan format \(HTTP 400: the response schema is too complex/,
+    );
+    expect(err.data.message).not.toMatch(/busy/i);
+    expect(err.data.details[0]).toMatch(
+      /^gemini-3\.6-flash: Gemini status 400 — Google said: INVALID_ARGUMENT: The specified schema/,
+    );
+    expect(err.data.details[1]).toMatch(
+      /^gemini-3\.8-flash \(tried first\): Gemini status 429 — Google said: RESOURCE_EXHAUSTED/,
+    );
+    expect(streams()).toEqual([PRIMARY, PRIMARY, 'gemini-3.6-flash']); // no 3rd model, no retry of the 400
+    expect(diag().filter((d) => d.event === 'model_fallback')).toHaveLength(1);
+    expect(diag().filter((d) => d.event === 'thinking_fallback')).toHaveLength(0); // not mistaken for a thinking problem
+    expect(JSON.stringify(err) + logs.join('\n')).not.toContain(KEY);
+  });
+
+  it('400 "too many states" on the primary: reported at once, no retry, no other model', async () => {
+    const base = await start((r) => (r.stream && r.model === PRIMARY ? SCHEMA_400 : undefined));
+    const err = (await plan(base)).at(-1)!;
+
+    expect(err.data.code).toBe('INTERNAL');
+    expect(err.data.message).toMatch(/response schema is too complex/);
+    expect(streams()).toEqual([PRIMARY]);
+    expect(diag().filter((d) => d.event === 'model_fallback')).toHaveLength(0);
+  });
+
+  it('regression: the OLD schema constructs really are what the fake rejects (so the tests above are meaningful)', async () => {
+    // Send an old-style schema straight to the fake, through the real SDK.
+    fake = await startFakeGemini(() => undefined, { models: KEY_MODELS });
+    const ai = new GoogleGenAI({ apiKey: KEY, httpOptions: { baseUrl: fake.baseUrl } });
+    const old = {
+      type: 'object',
+      properties: {
+        milestones: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 12,
+          items: { type: 'object', properties: { targetDate: { type: 'string', format: 'date' } } },
+        },
+      },
+    };
+    await expect(
+      ai.models.generateContent({
+        model: 'gemini-3.6-flash',
+        contents: 'x',
+        config: { responseMimeType: 'application/json', responseJsonSchema: old },
+      }),
+    ).rejects.toMatchObject({ status: 400 });
   });
 });

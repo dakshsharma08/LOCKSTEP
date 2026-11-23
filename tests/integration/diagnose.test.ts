@@ -4,7 +4,13 @@
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { runDiagnostics } from '../../server/gemini/diagnose';
-import { startFakeGemini, type FakeGemini, type FakeReply, type FakeRequest } from '../helpers/fakeGemini';
+import {
+  TOO_MANY_STATES,
+  startFakeGemini,
+  type FakeGemini,
+  type FakeReply,
+  type FakeRequest,
+} from '../helpers/fakeGemini';
 
 // Built at runtime: a key-shaped literal in source could trip GitHub secret scanning.
 const KEY = `${['AI', 'za'].join('')}SyFAKE-diagnostic-key-0123456789abcd`;
@@ -174,5 +180,68 @@ describe('diagnose: overloaded primary (HTTP 503) and the fallback chain', () =>
     expect(report.verdict.join('\n')).toMatch(
       /NO ALTERNATIVE MODEL: this key lists no other stable Flash model/,
     );
+  });
+});
+
+describe("diagnose: the owner's real case (primary over quota, plan schema on the alternatives)", () => {
+  const REAL = [
+    'gemini-3.8-flash',
+    'gemini-3.7-flash',
+    'gemini-3.6-flash',
+    'gemini-3.5-flash',
+    'gemini-2.5-flash',
+  ];
+  const quota = {
+    error: {
+      status: 429,
+      code: 'RESOURCE_EXHAUSTED',
+      message: 'You exceeded your current quota. Quota exceeded for metric: …free_tier_requests, limit: 20',
+    },
+  };
+
+  it('primary 429: says QUOTA, spends no more calls on it, and checks the real plan schema on 3.6 and 3.5', async () => {
+    const { report, text } = await diagnose((r) => (r.model === 'gemini-3.8-flash' ? quota : {}), {}, REAL);
+    const v = report.verdict.join('\n');
+
+    expect(v).toMatch(/QUOTA \/ RATE LIMIT: Google answered HTTP 429 for gemini-3\.8-flash/);
+    expect(v).not.toMatch(/OVERLOADED/);
+    expect(report.plan).toHaveLength(1); // the other thinking variants were skipped: they would only burn quota
+    expect(text).toMatch(/other thinking settings skipped: gemini-3\.8-flash answered HTTP 429/);
+    expect(report.planAlternatives.map((p) => [p.model, p.timing.ok, p.timing.jsonOk])).toEqual([
+      ['gemini-3.6-flash', true, true],
+      ['gemini-3.5-flash', true, true],
+    ]);
+    expect(v).toMatch(/PLAN SCHEMA OK on gemini-3\.6-flash/);
+    expect(v).toMatch(/PLAN SCHEMA OK on gemini-3\.5-flash/);
+    expect(v).not.toMatch(/SCHEMA TOO COMPLEX/);
+    expect(report.flow).toMatchObject({ ok: true, fellBack: true, model: 'gemini-3.6-flash' });
+    // The plan request each alternative got is the app's real one: prompt + response schema.
+    const sent = fake!.requests.filter((r) => planStream(r) && r.model === 'gemini-3.5-flash');
+    expect(sent.length).toBeGreaterThan(0);
+    expect(sent[0]!.body?.systemInstruction).toBeTruthy();
+    expect(text).not.toContain(KEY);
+  });
+
+  it('alternatives reject the plan schema (400 too many states): SCHEMA TOO COMPLEX, and the flow says so, not AI_BUSY', async () => {
+    const { report } = await diagnose(
+      (r) =>
+        r.model === 'gemini-3.8-flash'
+          ? quota
+          : planStream(r)
+            ? { error: { status: 400, code: 'INVALID_ARGUMENT', message: TOO_MANY_STATES } }
+            : {},
+      {},
+      REAL,
+    );
+    const v = report.verdict.join('\n');
+
+    expect(v).toMatch(
+      /SCHEMA TOO COMPLEX: Google rejected the plan's response schema \(HTTP 400\) on gemini-3\.6-flash, gemini-3\.5-flash/,
+    );
+    expect(v).toMatch(/another model will not help/);
+    expect(report.flow?.ok).toBe(false);
+    expect(report.flow?.error?.code).toBe('INTERNAL');
+    expect(report.flow?.error?.message).toMatch(/response schema is too complex/);
+    expect(v).not.toMatch(/FULL FLOW FAILED: AI_BUSY/);
   });
 });

@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AppError } from '../../server/lib/errors';
+import { AppError, toAppError } from '../../server/lib/errors';
+import { TOO_MANY_STATES } from '../helpers/fakeGemini';
 import {
   DEFAULT_MODEL_PLAN_LIMITS,
   allowedFallbackCount,
+  isModelUnavailable,
   isTemporaryUnavailable,
   maxUpstreamCalls,
   parseFallbackList,
@@ -236,6 +238,73 @@ describe('runWithFallback', () => {
       'gemini-2.5-flash',
       'gemini-3.6-flash',
     ]);
+  });
+
+  it('a schema rejection (400) on an alternative STOPS the chain: accurate error, not AI_BUSY, no 3rd model', async () => {
+    // The owner's real case: primary over quota (429), then gemini-3.6-flash rejected the schema (400).
+    const quota429 = new AppError('AI_BUSY', undefined, {
+      details: ['Gemini status 429', 'Google said: RESOURCE_EXHAUSTED: You exceeded your current quota.'],
+    });
+    const schema400 = toAppError(
+      Object.assign(
+        new Error(
+          JSON.stringify({ error: { code: 400, message: TOO_MANY_STATES, status: 'INVALID_ARGUMENT' } }),
+        ),
+        { status: 400 },
+      ),
+    );
+    const run = vi.fn(async (m: string) => {
+      if (m === 'gemini-3.8-flash') throw quota429;
+      throw schema400;
+    });
+    const e = (await runWithFallback(pool(['gemini-3.6-flash', 'gemini-3.5-flash']), run).catch(
+      (x) => x,
+    )) as AppError;
+
+    expect(run.mock.calls.map((c) => c[0])).toEqual(['gemini-3.8-flash', 'gemini-3.6-flash']);
+    expect(e).toBeInstanceOf(AppError);
+    expect(e.code).toBe('INTERNAL');
+    expect(e.code).not.toBe('AI_BUSY');
+    expect(e.retryable).toBe(false);
+    expect(e.message).toBe(schema400.message);
+    expect(e.message).not.toMatch(/busy/i);
+    expect(e.details![0]).toMatch(
+      /^gemini-3\.6-flash: Gemini status 400 — Google said: INVALID_ARGUMENT: The specified schema .*too many states/,
+    );
+    expect(e.details![1]).toMatch(
+      /^gemini-3\.8-flash \(tried first\): Gemini status 429 — Google said: RESOURCE_EXHAUSTED/,
+    );
+    expect(e.details).toContain('Not a temporary error, so no further model was tried.');
+  });
+
+  it('any other permanent error on an alternative (400, 403) also stops the chain', async () => {
+    const forbidden = new AppError('AI_NOT_CONFIGURED', 'key rejected', {
+      details: ['Gemini status 403', 'Google said: PERMISSION_DENIED: nope'],
+    });
+    for (const err of [bad400(), forbidden]) {
+      const run = vi.fn(async (m: string) => {
+        if (m === 'gemini-3.8-flash') throw busy503();
+        throw err;
+      });
+      const e = (await runWithFallback(pool(['gemini-3.6-flash', 'gemini-3.5-flash']), run).catch(
+        (x) => x,
+      )) as AppError;
+      expect(run).toHaveBeenCalledTimes(2);
+      expect(e.code).toBe(err.code);
+    }
+  });
+
+  it('only a temporary error or a 404 on an alternative moves on to the next one', async () => {
+    const run = vi.fn(async (m: string) => {
+      if (m === 'gemini-3.8-flash') throw busy503();
+      if (m === 'gemini-3.6-flash') throw busy503();
+      return 'ok';
+    });
+    const r = await runWithFallback(pool(['gemini-3.6-flash', 'gemini-3.5-flash']), run);
+    expect(r.model).toBe('gemini-3.5-flash');
+    expect(isModelUnavailable(missing404())).toBe(true);
+    expect(isModelUnavailable(bad400())).toBe(false);
+    expect(isModelUnavailable(busy503())).toBe(false);
   });
 
   it('never tries more alternatives than the cap allows', async () => {

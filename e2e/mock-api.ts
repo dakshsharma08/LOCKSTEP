@@ -27,12 +27,11 @@ type Body = {
   };
 };
 
+/** The dates the app allowed: the prompt line "Allowed milestone dates …" (the schema has no date list). */
 function allowedDates(body: Body): string[] {
-  const en =
-    body.generationConfig?.responseJsonSchema?.properties?.milestones?.items?.properties?.targetDate?.enum;
-  if (en?.length) return en;
   const sys = body.systemInstruction?.parts.map((p) => p.text).join('\n') ?? '';
-  return [...new Set(sys.match(/\d{4}-\d{2}-\d{2}/g) ?? [])].sort();
+  const line = /Allowed milestone dates[^\n]*/.exec(sys)?.[0] ?? sys;
+  return [...new Set(line.match(/\d{4}-\d{2}-\d{2}/g) ?? [])].sort();
 }
 
 function capacity(body: Body): number {

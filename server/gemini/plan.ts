@@ -115,7 +115,7 @@ export async function generatePlan(
     capacity: job.capacity,
     allowedDates: job.allowedDates,
   });
-  const responseJsonSchema = buildPlanJsonSchema(job.allowedDates);
+  const responseJsonSchema = buildPlanJsonSchema();
 
   emit({ event: 'status', data: { phase: 'thinking', message: 'Gemini is thinking about your plan…' } });
 

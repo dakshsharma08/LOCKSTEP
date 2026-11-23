@@ -8,6 +8,9 @@
  *   • HTTP headers that arrive late, or never          (a network problem)
  *   • headers right away but the first chunk very late (a model that "thinks" silently)
  *   • HTTP 400/403 errors with Google's JSON error body
+ *   • Google's HTTP 400 "too many states" for a response schema that is too complex (an APPROXIMATION:
+ *     the real limit is a state count we cannot see; the fake rejects the constructs Google's
+ *     structured-output docs name as state-heavy, so a schema that regresses is caught in tests)
  */
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -47,12 +50,51 @@ export interface FakeGemini {
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Google's exact wording when a response schema is too complex. */
+export const TOO_MANY_STATES =
+  'The specified schema produces a constraint that has too many states for serving. Typical causes of this error are schemas with lots of text (for example, very long property or enum names), schemas with long array length limits (especially when nested), or schemas using complex value matchers (for example, integers or numbers with minimum/maximum bounds or strings with complex formats like date-time)';
+
+/** Keywords the fake treats as "too many states" (from Google's own list of typical causes). */
+const HEAVY = [
+  'minItems',
+  'maxItems',
+  'minimum',
+  'maximum',
+  'exclusiveMinimum',
+  'exclusiveMaximum',
+  'format',
+];
+const MAX_ENUM = 20;
+
+/** Why the fake would reject this schema, or null if it accepts it. */
+export function heavySchemaReason(schema: unknown, path = '$'): string | null {
+  if (!schema || typeof schema !== 'object') return null;
+  if (Array.isArray(schema)) {
+    for (const [i, v] of schema.entries()) {
+      const r = heavySchemaReason(v, `${path}[${i}]`);
+      if (r) return r;
+    }
+    return null;
+  }
+  for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
+    if (HEAVY.includes(k)) return `${path}.${k}`;
+    if (k === 'enum' && Array.isArray(v) && v.length > MAX_ENUM) return `${path}.enum (${v.length} values)`;
+    const r = heavySchemaReason(v, `${path}.${k}`);
+    if (r) return r;
+  }
+  return null;
+}
+
+/** The dates the app allowed, read from the prompt line "Allowed milestone dates …". */
+export function allowedDatesFromPrompt(body: Record<string, any> | null): string[] {
+  const sys: string = (body?.systemInstruction?.parts ?? []).map((p: { text: string }) => p.text).join('\n');
+  const line = /Allowed milestone dates[^\n]*/.exec(sys)?.[0] ?? '';
+  return [...new Set(line.match(/\d{4}-\d{2}-\d{2}/g) ?? [])].sort();
+}
+
 /** A valid plan for the dates/capacity the app put into its request (so the app's own checks pass). */
 export function fixturePlan(body: Record<string, any> | null): Record<string, unknown> {
-  const enumDates: string[] =
-    body?.generationConfig?.responseJsonSchema?.properties?.milestones?.items?.properties?.targetDate?.enum ??
-    [];
-  const dates = [...enumDates].sort();
+  const dates = allowedDatesFromPrompt(body);
   const pick = (f: number) =>
     dates[Math.min(dates.length - 1, Math.max(0, Math.round(f * (dates.length - 1))))]!;
   const sys: string = (body?.systemInstruction?.parts ?? []).map((p: { text: string }) => p.text).join('\n');
@@ -92,7 +134,8 @@ export function fixturePlan(body: Record<string, any> | null): Record<string, un
 
 export async function startFakeGemini(
   decide: (r: FakeRequest) => FakeReply | void,
-  opts: { models?: string[] } = {},
+  /** acceptHeavySchemas: turn OFF the "too many states" emulation (on by default, like Google). */
+  opts: { models?: string[]; acceptHeavySchemas?: boolean } = {},
 ): Promise<FakeGemini> {
   const requests: FakeRequest[] = [];
   const sockets = new Set<import('node:net').Socket>();
@@ -121,7 +164,12 @@ export async function startFakeGemini(
       hasKey: !!req.headers['x-goog-api-key'],
     };
     requests.push(fr);
-    const reply = decide(fr) ?? {};
+    const heavy = opts.acceptHeavySchemas
+      ? null
+      : heavySchemaReason(fr.body?.generationConfig?.responseJsonSchema);
+    const reply: FakeReply = heavy
+      ? { error: { status: 400, code: 'INVALID_ARGUMENT', message: TOO_MANY_STATES } }
+      : (decide(fr) ?? {});
     if (reply.neverRespond) return; // hang: the socket stays open, nothing is sent
     if (reply.headersDelayMs) await wait(reply.headersDelayMs);
     if (res.destroyed) return;

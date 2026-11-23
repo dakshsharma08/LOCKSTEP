@@ -14,8 +14,10 @@
  *     drops out by itself. GEMINI_MODEL_FALLBACKS overrides it.
  *   • Hard cap on upstream calls per plan: 1 + primaryRetries + fallbacks (default 4 calls in total).
  *     503s also count against rate limits, so hammering a struggling API makes things worse.
- *   • A fallback that fails (even with a 404) is skipped, and the overall error stays an honest
- *     "Gemini is busy" instead of a confusing error about the last model tried.
+ *   • An alternative that is itself temporarily unavailable, or not available to this key (404), is
+ *     skipped. Any OTHER error from an alternative (a 400 such as "schema has too many states", a 403…)
+ *     stops the chain and is reported as it is, with the earlier attempts listed: trying yet another
+ *     model would hide a real problem behind a misleading "Gemini is busy".
  */
 import { AppError } from '../lib/errors';
 import { redactSecrets } from '../lib/redact';
@@ -145,6 +147,11 @@ export function isTemporaryUnavailable(err: unknown): boolean {
   return false;
 }
 
+/** A 404 from Google: this model is not available to this key (retired, or not offered to new users). */
+export function isModelUnavailable(err: unknown): boolean {
+  return err instanceof AppError && (err.details ?? []).some((x) => /^Gemini status 404/.test(x));
+}
+
 export interface ModelPool {
   primary: string;
   /** Alternatives, resolved lazily: only looked up once the primary has failed. Never throws. */
@@ -178,6 +185,24 @@ function totalFailure(tried: { model: string; error: unknown }[]): AppError {
   );
 }
 
+/**
+ * A permanent error from an alternative model: the same error (code, message, status), plus what was tried
+ * before it, so the log and the UI details show the whole story.
+ */
+function stoppedAt(err: unknown, model: string, before: { model: string; error: unknown }[]): unknown {
+  if (!(err instanceof AppError)) return err;
+  return new AppError(err.code, err.message, {
+    details: [
+      `${model}: ${why(err)}`,
+      ...before.map((t) => `${t.model} (tried first): ${why(t.error)}`),
+      `Not a temporary error, so no further model was tried.`,
+    ],
+    retryable: err.retryable,
+    status: err.status,
+    ...(err.headers ? { headers: err.headers } : {}),
+  });
+}
+
 /** Same error, plus a note that no alternative model was available. */
 function noAlternative(err: unknown): unknown {
   if (!(err instanceof AppError)) return err;
@@ -196,6 +221,7 @@ function noAlternative(err: unknown): unknown {
  * Run `run` on the primary model; on a temporary failure, on each alternative in turn (at most one call
  * each). Resolves with the first success and the model that produced it. Throws:
  *   • the primary's own error when it is not temporary (nothing is hidden),
+ *   • an alternative's own error when it is neither temporary nor a 404, with the earlier attempts,
  *   • "Gemini is very busy (N models tried)" with one detail line per model when everything failed,
  *   • the primary's error plus a note when there was nothing to fall back to.
  */
@@ -216,6 +242,10 @@ export async function runWithFallback<T>(
       if (err instanceof AppError && err.code === 'CANCELLED') throw err;
       // On the primary only a TEMPORARY failure justifies switching models.
       if (model === pool.primary && !isTemporaryUnavailable(err)) throw err;
+      // On an alternative, also a 404 (that model is not available to this key). Anything else is real.
+      if (model !== pool.primary && !isTemporaryUnavailable(err) && !isModelUnavailable(err)) {
+        throw stoppedAt(err, model, tried);
+      }
       tried.push({ model, error: err });
 
       queue ??= (await pool.fallbacks().catch(() => [] as string[]))
