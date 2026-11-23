@@ -150,3 +150,22 @@ Not tested: a real Supabase project (blocked host), Upstash, and a deployed envi
 - Left behind on purpose: `docs/evidence/` (generated screenshots and sample renders, ~28 MB) and a stray `_archive/` file.
 - Original development repository: untouched (no branch rewritten, deleted or merged).
 - Still to do before treating the submission as final: the real-Gemini run (§5, §9).
+
+## 11. Re-verification after migration to this repository
+
+Run 2026-11-23 05:49 UTC from a **fresh clone** of `https://github.com/dakshsharma08/LOCKSTEP` at commit `26a0d01` (nothing but what is on GitHub: `npm ci`, no cached files).
+
+| Check | Command | Result |
+|---|---|---|
+| Install from lockfile | `npm ci` | 841 packages, OK |
+| Typecheck | `npx tsc -b` | clean |
+| Lint | `npx eslint .` | clean |
+| Unit + integration | `npx vitest run` | **249 passed, 3 skipped** (16 files passed, 1 skipped) |
+| Production build | `npm run build` | OK in 10.5 s, secret-leak check passed |
+| Browser E2E + accessibility | `npx playwright test --trace off` | **20 / 20 passed** at 360 / 390 / 430 / 1440 px |
+| Working tree after install, build and tests | `git status` | clean (all generated output is git-ignored) |
+
+The 3 skipped tests are the live Gemini smoke tests (`tests/live/gemini.live.test.ts`), reported as SKIPPED rather than passed because no `GEMINI_API_KEY` is set: `health resolves a real model`, `streams a plan that passes every hard check`, `writes a motivation line and answers a coach question with tools`. Run them with `GEMINI_API_KEY=… npm run test:live`.
+
+Migration checks: 174 files / ~10 MB; no secret patterns; `.env.example` has no values; no cricket-project keywords; **0** file blobs in common with the original repository's non-LOCKSTEP files.
+
